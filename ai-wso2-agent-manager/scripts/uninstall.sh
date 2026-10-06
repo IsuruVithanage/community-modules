@@ -37,6 +37,8 @@ WORKFLOW_NS="${WORKFLOW_NS:-openchoreo-workflow-plane}"
 OBSERVABILITY_NS="${OBSERVABILITY_NS:-openchoreo-observability-plane}"
 DEFAULT_NS="${DEFAULT_NS:-default}"
 ORG_NAME="${ORG_NAME:-default}"
+# Where OpenChoreo keeps the Secrets it pushes to OpenBao for the namespace.
+KV_NS="${KV_NS:-openchoreo-kv-${DEFAULT_NS}}"
 SCRIPT_BASE_URL="${AMP_RAW}/deployments/scripts"
 # Shared components other modules may use. Set to true to keep them. Without
 # it, they are still kept while resources of their types remain.
@@ -117,6 +119,7 @@ amp_environment() {
 # --- 1. Agents, projects, pipelines, and additional environments -------------
 step "1. Agents, projects, pipelines, and additional environments"
 AGENT_MANAGER_TOKEN=""
+agents=""
 if curl -fsS -o /dev/null --max-time 10 "${AMP_API_URL}/healthz" 2>/dev/null && [ -n "${AMP_API_CLIENT_SECRET}" ]; then
   SCOPES="amp:project:read amp:project:delete amp:agent:read amp:agent:delete amp:deployment-pipeline:read"
   SCOPES="${SCOPES} amp:deployment-pipeline:update amp:deployment-pipeline:delete amp:environment:read amp:environment:delete"
@@ -327,7 +330,69 @@ for kind in rolebinding role serviceaccount; do
     | grep -E "/api-platform-${ORG_NAME}-[a-z0-9-]+-bootstrap-(role|rolebinding|sa)$" \
     | xargs -r kubectl delete -n "${DATA_PLANE_NS}" --ignore-not-found >/dev/null || true
 done
-info "Deleted Helm hook leftovers (evaluation template, gateway bootstrap RBAC)"
+# Each removed gateway also leaves its bootstrap Job (a hook), the registration
+# token Secret the Job writes with kubectl, and the controller TLS Secret that
+# cert-manager keeps after its Certificate is gone. Skip gateways whose release
+# still exists, for example after a failed environment removal.
+gateway_releases="$(helm list -n "${DATA_PLANE_NS}" -q 2>/dev/null || true)"
+kubectl get job,secret -n "${DATA_PLANE_NS}" -o name 2>/dev/null \
+  | grep -E "/api-platform-${ORG_NAME}-[a-z0-9-]+-(bootstrap|token|gw-gateway-controller-tls)$" \
+  | while read -r resource; do
+      release="$(sed -E 's#^[^/]+/##; s#-(bootstrap|token|gw-gateway-controller-tls)$##' <<<"${resource}")"
+      grep -qx "${release}" <<<"${gateway_releases}" && continue
+      kubectl delete -n "${DATA_PLANE_NS}" "${resource}" --ignore-not-found >/dev/null || true
+    done || true
+info "Deleted Helm hook and gateway leftovers (evaluation template, bootstrap Jobs and RBAC, token and TLS Secrets)"
+# Monitor runs are WorkflowRuns that no deleted resource owns. Deleting one lets
+# OpenChoreo remove its workflow-plane Secrets, ExternalSecrets, and Argo runs.
+monitor_runs="$(kubectl get workflowruns.openchoreo.dev -n "${DEFAULT_NS}" -o json 2>/dev/null | python3 -c '
+import json, sys
+for r in json.load(sys.stdin)["items"]:
+    if (r.get("spec", {}).get("workflow") or {}).get("name") == "monitor-evaluation-workflow":
+        print(r["metadata"]["name"])' 2>/dev/null || true)"
+if [ -n "${monitor_runs}" ]; then
+  echo "${monitor_runs}" | xargs kubectl delete workflowruns.openchoreo.dev -n "${DEFAULT_NS}" \
+    --ignore-not-found --timeout=3m >/dev/null 2>&1 \
+    && info "Deleted $(echo "${monitor_runs}" | wc -l | tr -d ' ') monitor runs" \
+    || warn "Some monitor runs are still being removed; re-run to check"
+fi
+# Deleting a run does not always remove what it created in the workflow plane,
+# and deleting an agent leaves its build runs' objects too. Remove the objects
+# whose run in ${DEFAULT_NS} no longer exists; Argo deletes the pods and the
+# ExternalSecrets their Secrets.
+live_runs="$(kubectl get workflowruns.openchoreo.dev -n "${DEFAULT_NS}" -o name 2>/dev/null | sed 's|.*/||' || true)"
+orphans=0
+for type in externalsecrets.external-secrets.io workflows.argoproj.io secrets; do
+  while read -r namespace names; do
+    [ -n "${names:-}" ] || continue
+    kubectl delete "${type}" -n "${namespace}" ${names} --ignore-not-found >/dev/null 2>&1 || true
+    orphans=$((orphans + $(wc -w <<<"${names}")))
+  done < <(kubectl get "${type}" -A -o json \
+    -l "openchoreo.dev/managed-by=workflowrun-controller,openchoreo.dev/workflowrun-namespace=${DEFAULT_NS}" 2>/dev/null \
+    | LIVE="${live_runs}" python3 -c '
+import collections, json, os, sys
+live = set(os.environ["LIVE"].split())
+orphans = collections.defaultdict(list)
+for item in json.load(sys.stdin)["items"]:
+    meta = item["metadata"]
+    run = meta["labels"].get("openchoreo.dev/workflowrun") or ""
+    # Only the run'"'"'s own objects, which are named after it. Shared ones, such
+    # as the workflow service account token, carry the label of the last run
+    # that applied them.
+    if run and run not in live and (meta["name"] == run or meta["name"].startswith(run + "-")):
+        orphans[meta["namespace"]].append(meta["name"])
+for namespace, names in orphans.items():
+    print(namespace, " ".join(names))' 2>/dev/null || true)
+done
+[ "${orphans}" -gt 0 ] && info "Deleted ${orphans} workflow-plane objects of deleted runs"
+# Agent Manager grants its runtime clients OpenChoreo access at run time.
+kubectl get clusterauthzrolebindings.openchoreo.dev -o json 2>/dev/null | python3 -c '
+import json, re, sys
+for b in json.load(sys.stdin)["items"]:
+    value = ((b.get("spec") or {}).get("entitlement") or {}).get("value") or ""
+    if re.match(r"amp-(publisher|scheduler)-", value):
+        print(b["metadata"]["name"])' 2>/dev/null \
+  | xargs -r kubectl delete clusterauthzrolebindings.openchoreo.dev --ignore-not-found >/dev/null 2>&1 || true
 kubectl delete -n "${OBSERVABILITY_NS}" -f "${MODULE_DIR}/resources/amp-observer-ingress.yaml" --ignore-not-found >/dev/null
 uninstall_release amp-observability-traces "${OBSERVABILITY_NS}"
 uninstall_release amp-platform-resources "${DEFAULT_NS}"
@@ -371,6 +436,8 @@ else
   kubectl delete -f "${MODULE_DIR}/resources/rbac.yaml" --ignore-not-found >/dev/null
   uninstall_release gateway-operator "${DATA_PLANE_NS}"
   kubectl delete secret gateway-encryption-keys -n "${DATA_PLANE_NS}" --ignore-not-found >/dev/null
+  kubectl get lease -n "${DATA_PLANE_NS}" -o name 2>/dev/null | grep '\.gateway\.api-platform\.wso2\.com$' \
+    | xargs -r kubectl delete -n "${DATA_PLANE_NS}" --ignore-not-found >/dev/null || true
   # Helm never deletes a chart's CRDs.
   if [ -n "${GATEWAY_TYPES}" ]; then
     kubectl delete crd ${GATEWAY_TYPES} --ignore-not-found >/dev/null && info "Deleted the API Platform Gateway CRDs"
@@ -426,6 +493,58 @@ if kubectl get pod openbao-0 -n openbao >/dev/null 2>&1; then
       warn "Could not delete secret/${entry} from OpenBao; check BAO_TOKEN"
     fi
   done
+fi
+
+# Secrets Agent Manager stored through OpenChoreo's secret management: agent API
+# keys and identities, agent environment variables, MCP and LLM proxy keys, and
+# monitor credentials. Each has a SecretReference in the namespace, a Secret and
+# PushSecret in ${KV_NS}, and an OpenBao key, and deleting an agent or proxy
+# can leave some of them behind. They are recognized by Agent Manager's label
+# and by the names it gives them, including names prefixed with an agent's name.
+bao_keys=""
+if kubectl get pod openbao-0 -n openbao >/dev/null 2>&1; then
+  for prefix in "secret/${DEFAULT_NS}/generic" "secret/secret/${DEFAULT_NS}/generic"; do
+    bao_keys="${bao_keys}$(bao kv list -format=json "${prefix}" 2>/dev/null | PREFIX="${prefix}" python3 -c '
+import json, os, sys
+for key in json.load(sys.stdin):
+    if not key.endswith("/"):
+        print(os.environ["PREFIX"] + "/" + key)' 2>/dev/null || true)"$'\n'
+  done
+fi
+labelled="$(kubectl get secretreferences.openchoreo.dev -n "${DEFAULT_NS}" -l managed-by=amp-agent-manager \
+  -o name 2>/dev/null | sed 's|.*/||' || true)"
+candidates="$( { echo "${labelled}"
+  kubectl get pushsecrets.external-secrets.io -n "${KV_NS}" -o name 2>/dev/null | sed 's|.*/||'
+  echo "${bao_keys}" | sed 's|.*/||'; } | sort -u)"
+amp_secrets="$(echo "${candidates}" | LABELLED="${labelled}" AGENTS="$(printf '%s\n' ${agents} | sed 's|.*/||')" python3 -c '
+import os, re, sys
+names = {line.strip() for line in sys.stdin if line.strip()}
+labelled = set(os.environ["LABELLED"].split())
+agents = set(os.environ["AGENTS"].split())
+owned = re.compile(r"^(.+)-agent-(api-key|identity)-[a-z0-9-]+-secrets$")
+agents.update(m.group(1) for m in map(owned.match, names) if m)
+fixed = re.compile(r"^(amp-(publisher|scheduler)-.+-secrets|.+-agent-(api-key|identity)-[a-z0-9-]+-secrets"
+                   r"|.+-proxy-sec(rets)?|monitor-[0-9a-f-]{36}-secrets)$")
+for name in sorted(names):
+    if name in labelled or fixed.match(name) or (
+            name.endswith("-secrets") and any(name.startswith(a + "-") for a in agents)):
+        print(name)')"
+if [ -n "${amp_secrets}" ]; then
+  # A PushSecret deletes its OpenBao key when it is deleted.
+  echo "${amp_secrets}" | xargs kubectl delete secretreferences.openchoreo.dev -n "${DEFAULT_NS}" \
+    --ignore-not-found >/dev/null 2>&1 || true
+  echo "${amp_secrets}" | xargs kubectl delete pushsecrets.external-secrets.io -n "${KV_NS}" \
+    --ignore-not-found --timeout=2m >/dev/null 2>&1 || warn "Some PushSecrets in ${KV_NS} are still being removed"
+  echo "${amp_secrets}" | xargs kubectl delete secret -n "${KV_NS}" --ignore-not-found >/dev/null 2>&1 || true
+  deleted_keys=0
+  while read -r key; do
+    [ -n "${key}" ] || continue
+    grep -qx "${key##*/}" <<<"${amp_secrets}" || continue
+    bao kv metadata delete "${key}" >/dev/null 2>&1 && deleted_keys=$((deleted_keys + 1))
+  done <<<"${bao_keys}"
+  info "Deleted $(echo "${amp_secrets}" | wc -l | tr -d ' ') Agent Manager secrets ($deleted_keys OpenBao keys)"
+else
+  info "No Agent Manager secrets found"
 fi
 
 # --- 5. Identities -----------------------------------------------------------
