@@ -19,9 +19,9 @@
 - [Step 8: Install Evaluation Extension (Optional)](#step-8-install-evaluation-extension-optional)
 - [Step 9: Install API Platform Gateway Extension](#step-9-install-api-platform-gateway-extension)
 - [Step 10: Provision the Environment Identity Provider](#step-10-provision-the-environment-identity-provider)
-- [Adding Environments](#adding-environments)
 - [Verification](#verification)
 - [Access](#access)
+- [Adding Environments](#adding-environments)
 - [Uninstallation](#uninstallation)
 - [Compatibility](#compatibility)
 
@@ -845,6 +845,80 @@ kubectl get pods -n ${DATA_PLANE_NS} | grep gateway-controller
 
 ---
 
+## Verification
+
+```bash
+# Agent Manager core
+kubectl get pods -n ${AMP_NS}
+
+# Gateway Operator, API Platform Gateway, and its bootstrap
+kubectl get pods -n ${DATA_PLANE_NS} -l app.kubernetes.io/name=gateway-operator
+kubectl get apigateway api-platform-default-default -n ${DATA_PLANE_NS}
+kubectl get jobs -n ${DATA_PLANE_NS} | grep api-platform-default-default-bootstrap
+
+# Agent Sandbox
+kubectl get pods -n agent-sandbox-system
+kubectl get crd sandboxtemplates.extensions.agents.x-k8s.io \
+  sandboxwarmpools.extensions.agents.x-k8s.io sandboxclaims.extensions.agents.x-k8s.io
+
+# Platform resources
+kubectl get environment,deploymentpipeline,project -n ${DEFAULT_NS}
+kubectl get clusterauthzrolebinding amp-api-client-binding amp-observer-reader-binding amp-workload-deployer-binding
+
+# Observability extension
+kubectl get deployment amp-observer -n ${OBSERVABILITY_NS}
+
+# Environment Thunder
+kubectl get pods -n amp-thunder-default-default
+
+# Helm releases
+helm list -A | grep -E 'amp|gateway|agent-sandbox'
+```
+
+The `APIGateway` should report `Programmed`, and the bootstrap job `Complete`. Then open the console, sign in with an existing OpenChoreo user in the AMP administrators group, and create, build, and deploy an agent.
+
+---
+
+## Access
+
+| Service | URL |
+|---------|-----|
+| Agent Manager Console | `https://${AMP_CONSOLE_HOST}` |
+| Agent Manager API | `https://${AMP_API_HOST}` |
+| Agent Manager Observer | `https://${AMP_OBSERVER_HOST}` |
+| Deployed agents | `https://<env>-<org>.${DP_DOMAIN}`, for example `https://${AMP_GATEWAY_HOST}` |
+| OTLP trace ingest | `${INSTRUMENTATION_URL}` |
+
+Print the addresses and the console sign-in accounts. Sign in with a user from `AMP_ADMIN_USER_IDS`, the members of the AMP administrators group that [Step 1](#step-1-configure-identities) created. On OpenChoreo's reference installation these are its sample users, whose passwords are in the Thunder release values; for any other user, use that user's OpenChoreo password. Run it from the [module tools](#download-the-module-tools) folder, which has the virtual environment:
+
+```bash
+echo "Console:  ${AMP_CONSOLE_URL}"
+echo "API:      ${AMP_API_URL}"
+echo "Observer: ${AMP_OBSERVER_URL}"
+echo "Agents:   https://${AMP_GATEWAY_HOST}"
+echo "Sign in to the console as:"
+helm get values thunder -n ${THUNDER_NAMESPACE} -a -o json \
+  | AMP_ADMIN_USER_IDS="${AMP_ADMIN_USER_IDS}" .venv/bin/python -c '
+import json, os, sys, yaml
+admins = os.environ["AMP_ADMIN_USER_IDS"].replace(",", " ").split()
+users = {}
+for name, script in ((json.load(sys.stdin).get("bootstrap") or {}).get("scripts") or {}).items():
+    if name.endswith((".yaml", ".yml")):
+        for doc in yaml.safe_load_all(script):
+            if isinstance(doc, dict) and doc.get("resource_type") == "user":
+                users[doc.get("id")] = doc
+for user_id in admins:
+    user = users.get(user_id)
+    if user:
+        print("  ", user["attributes"].get("username"), "/", (user.get("credentials") or {}).get("password"))
+    else:
+        print("  ", user_id, "is not in the Thunder bootstrap values; use the OpenChoreo password of that user")'
+```
+
+The sample passwords are for evaluation; change them before you share the installation. The environment Thunder's own administrator, `admin`, is only for administering that Thunder; [Step 10](#step-10-provision-the-environment-identity-provider) shows how to read its password.
+
+---
+
 ## Adding Environments
 
 Additional environments are created from the Console (**Deployment Pipelines → Environments → Create Environment**), which generates an `add-environment.sh` command to run in a terminal with `kubectl` and `helm` configured. The self-hosted release has no automatic provisioning; on Agent Manager Cloud, WSO2 runs the equivalent automation.
@@ -913,52 +987,6 @@ helm get values amp-thunder-default-${NEW_ENV} -n amp-thunder-default-${NEW_ENV}
 Agents in the project can then be promoted from the first environment to the next.
 
 If the environment was already created without the exported settings, re-run the Step 10 `add-environment-thunder.sh` command with `ENV_NAME`, `DISPLAY_NAME`, and `THUNDER_HANDLE` set to that environment's values. It is safe to re-run: it keeps the environment's secrets and updates the trusted issuer.
-
----
-
-## Verification
-
-```bash
-# Agent Manager core
-kubectl get pods -n ${AMP_NS}
-
-# Gateway Operator, API Platform Gateway, and its bootstrap
-kubectl get pods -n ${DATA_PLANE_NS} -l app.kubernetes.io/name=gateway-operator
-kubectl get apigateway api-platform-default-default -n ${DATA_PLANE_NS}
-kubectl get jobs -n ${DATA_PLANE_NS} | grep api-platform-default-default-bootstrap
-
-# Agent Sandbox
-kubectl get pods -n agent-sandbox-system
-kubectl get crd sandboxtemplates.extensions.agents.x-k8s.io \
-  sandboxwarmpools.extensions.agents.x-k8s.io sandboxclaims.extensions.agents.x-k8s.io
-
-# Platform resources
-kubectl get environment,deploymentpipeline,project -n ${DEFAULT_NS}
-kubectl get clusterauthzrolebinding amp-api-client-binding amp-observer-reader-binding amp-workload-deployer-binding
-
-# Observability extension
-kubectl get deployment amp-observer -n ${OBSERVABILITY_NS}
-
-# Environment Thunder
-kubectl get pods -n amp-thunder-default-default
-
-# Helm releases
-helm list -A | grep -E 'amp|gateway|agent-sandbox'
-```
-
-The `APIGateway` should report `Programmed`, and the bootstrap job `Complete`. Then open the console, sign in with an existing OpenChoreo user in the AMP administrators group, and create, build, and deploy an agent.
-
----
-
-## Access
-
-| Service | URL |
-|---------|-----|
-| Agent Manager Console | `https://${AMP_CONSOLE_HOST}` |
-| Agent Manager API | `https://${AMP_API_HOST}` |
-| Agent Manager Observer | `https://${AMP_OBSERVER_HOST}` |
-| Deployed agents | `https://<env>-<org>.${DP_DOMAIN}`, for example `https://${AMP_GATEWAY_HOST}` |
-| OTLP trace ingest | `${INSTRUMENTATION_URL}` |
 
 ---
 
