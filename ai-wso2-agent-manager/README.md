@@ -158,6 +158,19 @@ kubectl run thunder-issuer --rm -i --restart=Never --image=curlimages/curl -- \
   -s "${THUNDER_INTERNAL_URL}/.well-known/openid-configuration" | grep -o '"issuer":"[^"]*"'
 ```
 
+### Download the Module Tools
+
+Identity provisioning ([Step 1](#step-1-configure-identities)), trace ingestion ([Step 2](#step-2-prepare-openchoreo)), and [uninstallation](#uninstallation) run this module's scripts, which read templates from its `values/` and `resources/` folders. Download them with that layout into an empty working folder, and run every remaining command in this guide from that folder:
+
+```bash
+mkdir -p amp-install && cd amp-install
+for f in scripts/provision-thunder-identities.py scripts/merge-collector-config.py scripts/uninstall.sh \
+         scripts/requirements.txt values/thunder-identities.yaml values/agent-manager-v1.yaml \
+         resources/amp-thunder-identities.yaml resources/amp-observer-ingress.yaml resources/rbac.yaml; do
+  curl -fsSL --create-dirs -o "${f}" "${MODULE_RAW}/${f}"
+done
+```
+
 ### Trust the Gateway CA
 
 Several steps call Thunder and the Agent Manager API over HTTPS from your machine, so trust the CA that signs the gateway certificates first. `OPENCHOREO_CA_FILE` is used by the Python identity tool and the environment Thunder; `CURL_CA_BUNDLE` by `curl`.
@@ -188,7 +201,7 @@ export CURL_CA_BUNDLE="${PWD}/amp-ca-bundle.crt"
 
 [Step 10](#step-10-provision-the-environment-identity-provider) passes the same file to the environment Thunder, so every environment trusts the same CA.
 
-Keep this shell session for the whole installation. [Step 1](#step-1-configure-identities) also exports the client secrets used by later steps.
+Keep this shell session and working folder for the whole installation. [Step 1](#step-1-configure-identities) also exports the client secrets used by later steps.
 
 ---
 
@@ -316,7 +329,7 @@ kubectl create secret generic amp-openbao-token -n ${AMP_NS} \
 
 Agent Manager needs two additions to the tracing module's OpenTelemetry Collector: the OTLP HTTP receiver must keep request metadata, and a `resource/amp` processor copies the `x-user-*` headers set by the Agent Manager gateway into `openchoreo.dev/*` resource attributes. Spans without those headers are left unchanged.
 
-Do not replace the collector configuration. Build a merged copy from the live one instead: [`scripts/merge-collector-config.py`](scripts/merge-collector-config.py) keeps every existing receiver (including OTLP gRPC on port `4317`), processor (such as `k8sattributes` and tail sampling), exporter, and customized value, and adds only the two changes. Run it from your checkout of this module, with the virtual environment from [Step 1](#step-1-configure-identities):
+Do not replace the collector configuration. Build a merged copy from the live one instead: [`scripts/merge-collector-config.py`](scripts/merge-collector-config.py) keeps every existing receiver (including OTLP gRPC on port `4317`), processor (such as `k8sattributes` and tail sampling), exporter, and customized value, and adds only the two changes. Run it from the [module tools](#download-the-module-tools) folder, with the virtual environment from [Step 1](#step-1-configure-identities):
 
 ```bash
 kubectl get configmap opentelemetry-collector -n ${OBSERVABILITY_NS} -o yaml \
@@ -961,7 +974,7 @@ The `APIGateway` should report `Programmed`, and the bootstrap job `Complete`. T
 | 4 | Points the tracing module back at its own collector configuration and, once that succeeds, deletes the merged copy, and deletes the two Agent Manager client secrets from OpenBao. `secret/workflow-plane-oauth-client-secret` is kept for OpenChoreo's builds. Also the secrets Agent Manager stored through OpenChoreo's secret management (agent API keys and identities, agent environment variables, MCP and LLM proxy keys, monitor credentials), with their SecretReferences, PushSecrets, and OpenBao keys. They are recognized by Agent Manager's label and naming, including names that start with an agent's name |
 | 5 | The Agent Manager identities and shared-setting changes in OpenChoreo's Thunder, with the `remove` command from [IDENTITY.md](IDENTITY.md#remove-the-identities). A new installation requires this: the Step 1 import refuses to overwrite existing identities |
 
-Run it from a checkout of this module, with the [Configuration Variables](#configuration-variables) exported. For step 5, also export the identity configuration from [IDENTITY.md](IDENTITY.md#2-prepare-the-configuration-and-client-secrets) and the secret of OpenChoreo's `openchoreo-system-app` client, which the script uses to request a Thunder administration token. Without them it skips step 5 and tells you so:
+Run it from the [module tools](#download-the-module-tools) folder, with the [Configuration Variables](#configuration-variables) exported. For step 5, also export the identity configuration from [IDENTITY.md](IDENTITY.md#2-prepare-the-configuration-and-client-secrets) and the secret of OpenChoreo's `openchoreo-system-app` client, which the script uses to request a Thunder administration token. Without them it skips step 5 and tells you so:
 
 ```bash
 export AMP_IDENTITY_CONFIG="${AMP_IDENTITY_WORK}/configuration.yaml"

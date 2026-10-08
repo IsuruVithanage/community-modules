@@ -2,7 +2,7 @@
 
 Use this procedure to add Agent Manager identities to an existing ThunderID 1.0.x installation. It creates AMP-specific clients, resource servers, roles, and an administrators group. It preserves OpenChoreo clients, users, signing keys, and Thunder's built-in Administrator role. The only shared settings it changes are the two in [step 5](#5-configure-shared-settings), and only after you confirm them.
 
-Run the commands from `ai-wso2-agent-manager/` in a local checkout. Python 3.10+ and access to Thunder's administration API are required. This is a fresh provisioning procedure: it refuses to overwrite an existing AMP resource. For existing registrations, inventory and reconcile their IDs, permissions, and credentials separately.
+Run the commands from the folder where you downloaded the [module tools](README.md#download-the-module-tools). Python 3.10+ and access to Thunder's administration API are required. This is a fresh provisioning procedure: it refuses to overwrite an existing AMP resource. For existing registrations, inventory and reconcile their IDs, permissions, and credentials separately.
 
 ## Compatibility
 
@@ -42,7 +42,11 @@ Thunder's System resource identifier must be `<thunder-public-url>/mcp`, matchin
 
 Back up existing identity configuration and keep the same issuer and signing keys. The tool needs a system-scoped administrative token in `THUNDER_ADMIN_TOKEN`. Do not place tokens in Git or command-line arguments.
 
-OpenChoreo v1.3.x registers an `openchoreo-system-app` client for this purpose: it uses client credentials and holds the `system` permission on the System resource server. Request a token from it with the System resource identifier as the `resource`. Set `THUNDER_PUBLIC_URL` to the issuer, and use the client secret from the Thunder values OpenChoreo was installed with (the reference installation uses `openchoreo-system-app-secret`):
+OpenChoreo v1.3.x registers an `openchoreo-system-app` client for this purpose: it uses client credentials and holds the `system` permission on the System resource server. Request a token from it with the System resource identifier as the `resource`. Set `THUNDER_PUBLIC_URL` to the issuer, and set the client secret from the Thunder values OpenChoreo was installed with. The reference installation uses `openchoreo-system-app-secret`; an empty value fails with HTTP 401:
+
+```bash
+export OPENCHOREO_SYSTEM_APP_SECRET="openchoreo-system-app-secret"
+```
 
 ```bash
 export THUNDER_ADMIN_TOKEN=$(curl -fsS -X POST "${THUNDER_PUBLIC_URL}/oauth2/token" \
@@ -85,7 +89,7 @@ For example, `export AMP_AUTH_FLOW_ID="<login flow ID>" AMP_ADMIN_USER_IDS="<use
 
 ## 2. Prepare the configuration and client secrets
 
-Create a virtual environment and a private working directory outside the checkout:
+Create a virtual environment in that folder, and a private working directory outside it:
 
 ```bash
 python3 -m venv .venv
