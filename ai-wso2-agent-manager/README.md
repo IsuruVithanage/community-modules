@@ -77,7 +77,7 @@ Agent Manager charts are pulled from `oci://ghcr.io/wso2` at version `1.0.0` unl
 
 - OpenChoreo v1.3.x installed with the control plane, data plane, workflow plane, and observability plane running, following the [OpenChoreo installation guide](https://openchoreo.dev/docs/getting-started/try-it-out/on-your-environment/)
 - ThunderID 1.0.x as OpenChoreo's identity provider. OpenChoreo v1.3.x installs ThunderID 1.0.1 as the `thunder` release in the `thunder` namespace
-- OpenBao as the backend of the `default` `ClusterSecretStore`. Agent Manager reads Git credentials from OpenBao directly over the Vault API, so another External Secrets provider cannot replace it
+- A Vault-compatible secret store for Agent Manager, which reads and writes Git credentials and agent secrets over the Vault KV v2 API. OpenChoreo installs OpenBao by default; HashiCorp Vault also works. The `default` `ClusterSecretStore` may use another provider; see [Using a secret store other than OpenBao](#using-a-secret-store-other-than-openbao)
 - The `observability-logs-opensearch` and `observability-tracing-opensearch` modules installed in `openchoreo-observability-plane`
 - A container registry the workflow plane can push to, which creates repositories on push and uses static credentials (for example CNCF Distribution or Harbor; Amazon ECR does not work)
 - `helm` v3.12+ (Helm 3 only), `kubectl` v1.32+, `curl`, and Python 3.10+
@@ -324,6 +324,18 @@ kubectl create secret generic amp-openbao-token -n ${AMP_NS} \
   --from-literal=openbao-token="${AMP_BAO_TOKEN}" \
   --from-literal=workflow-plane-openbao-token="${AMP_BAO_TOKEN}"
 ```
+
+#### Using a secret store other than OpenBao
+
+The commands above write to OpenBao, the secret store OpenChoreo installs by default. If your `default` `ClusterSecretStore` uses another backend, create the same entries there with that store's own tools, under the same names and with the secret in a `value` field:
+
+| Entry | Value |
+|---|---|
+| `amp-publisher-client-secret` | `${AMP_PUBLISHER_CLIENT_SECRET}` |
+| `amp-system-client-secret` | `${AMP_SYSTEM_CLIENT_SECRET}` |
+| `workflow-plane-oauth-client-secret` | Only if it is missing: the secret Thunder registers for `openchoreo-workload-publisher-client` |
+
+Build and evaluation workflows read these through External Secrets, so any provider that External Secrets supports works for them. The Agent Manager API itself also reads and writes Git credentials and agent secrets over the Vault KV v2 API, so it still needs OpenBao or another Vault-compatible store, such as HashiCorp Vault. For a store at a different address, set `agentManagerService.config.openbao.url` and `agentManagerService.config.workflowPlaneOpenbao.url` in [Step 4](#step-4-install-agent-manager-core), and put a token for that store in the `amp-openbao-token` Secret.
 
 ### Configure Trace Ingestion
 
@@ -622,7 +634,7 @@ The policy admits only the Agent Manager API pods in `wso2-amp` and evaluation j
 
 ---
 
-## Step 8: Install Evaluation Extension (Optional)
+## Step 8: Install Evaluation Extension
 
 > **Cluster:** Workflow Plane
 
