@@ -97,7 +97,7 @@ kubectl get clusterworkflowtemplate checkout-source publish-image \
   containerfile-build gcp-buildpacks-build ballerina-buildpack-build
 ```
 
-If any exist, install Agent Manager on an OpenChoreo installation where the sample bundle was not applied. Deleting or replacing them breaks OpenChoreo components that use them.
+If any exist, install Agent Manager on an OpenChoreo installation where the sample bundle was not applied. Deleting or replacing them breaks OpenChoreo components that use them. Existing environments are not a conflict. An environment named `default` becomes Agent Manager's first environment instead of the one [Step 6](#step-6-install-platform-resources) would create, and [Step 10](#step-10-configure-the-environments) configures every environment for Agent Manager and keeps those it did not create.
 
 ---
 
@@ -618,9 +618,21 @@ Creates the Agent Manager component types, traits, build workflows, and workflow
 
 The chart defaults point at a local k3d cluster. These values point the build workflows at OpenChoreo's Thunder and API, the traits at the namespace the gateway is installed in ([Step 9](#step-9-install-api-platform-gateway-extension)), and the default Environment at the data plane domain:
 
+Agent Manager's first environment is named `default`. The chart creates it, unless OpenChoreo already has an environment with that name: then the first block installs the chart without its `Environment`, so the release neither changes nor owns your environment, and uninstalling Agent Manager keeps it. Run the blocks in order:
+
 ```bash
-helm install amp-platform-resources \
-  oci://${HELM_CHART_REGISTRY}/wso2-amp-platform-resources-extension \
+PLATFORM_CHART="oci://${HELM_CHART_REGISTRY}/wso2-amp-platform-resources-extension"
+if kubectl get environment default -n ${DEFAULT_NS} >/dev/null 2>&1; then
+  rm -rf charts/wso2-amp-platform-resources-extension
+  helm pull "${PLATFORM_CHART}" --version ${AMP_VERSION} --untar --untardir charts
+  rm charts/wso2-amp-platform-resources-extension/templates/environment.yaml
+  PLATFORM_CHART="charts/wso2-amp-platform-resources-extension"
+  echo "Using the existing default environment"
+fi
+```
+
+```bash
+helm install amp-platform-resources "${PLATFORM_CHART}" \
   --version ${AMP_VERSION} \
   --namespace ${DEFAULT_NS} \
   --set global.oauth.tokenUrl="${THUNDER_INTERNAL_URL}/oauth2/token" \
@@ -636,6 +648,8 @@ helm install amp-platform-resources \
   --set environment.gateway.https.port=${AGENTS_HTTPS_PORT} \
   --timeout 1800s
 ```
+
+Use the same `PLATFORM_CHART` for any later `helm upgrade` of this release; the published chart would try to create the `default` environment again. An existing `default` environment keeps its own settings, so it must use the `default` ClusterDataPlane, which serves Agent Manager's gateways.
 
 The Environment's gateway binding replaces the data plane's rather than merging with it, so set both variants, each on the port its listener serves. Putting the HTTPS port on the `http` variant makes the console publish `http://<host>:443`, which a browser blocks as mixed content.
 
@@ -761,7 +775,7 @@ The agent sandbox's network policy, which the `agent-api` component type defines
 
 > **Cluster:** Control Plane and Data Plane
 
-Agent Manager lists every OpenChoreo environment in `${DEFAULT_NS}`: the `default` environment that [Step 6](#step-6-install-platform-resources) created, and any environment that already existed in OpenChoreo. Before agents can run in an environment, it needs two things:
+Agent Manager lists every OpenChoreo environment in `${DEFAULT_NS}`: the `default` environment, which [Step 6](#step-6-install-platform-resources) created unless it already existed, and any other environment that already existed in OpenChoreo. Before agents can run in an environment, it needs two things:
 
 - **An environment Thunder**, which issues each agent its OAuth2 credential (AgentID) and the tokens agents use for OAuth-protected MCP servers. It is separate from OpenChoreo's Thunder, which handles console and API sign-in. Without it, agents never get an AgentID and Agent Manager keeps retrying in the background.
 - **An API Platform Gateway** registered for the environment, which serves its agents and their MCP and LLM proxies, with that environment Thunder as its key manager and identity provider.

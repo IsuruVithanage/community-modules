@@ -318,7 +318,7 @@ fi
 # platform resources release in step 3; adopted environments are kept.
 step "2. Default and adopted environments"
 thunder_script=""
-for environment in default ${adopted_environments}; do
+for environment in $(printf '%s\n' default ${adopted_environments} | awk 'NF && !seen[$0]++'); do
   if kubectl get namespace "amp-thunder-${ORG_NAME}-${environment}" >/dev/null 2>&1; then
     if [ -z "${AMP_API_CLIENT_SECRET}" ]; then
       warn "No amp-api-client secret; the ${environment} environment ThunderID was not removed"
@@ -337,7 +337,7 @@ for environment in default ${adopted_environments}; do
     info "The ${environment} environment ThunderID was not found, skipping"
   fi
   uninstall_release "api-platform-${ORG_NAME}-${environment}" "${DATA_PLANE_NS}"
-  if [ "${environment}" != default ]; then
+  if is_adopted "${environment}"; then
     kubectl label environment.openchoreo.dev "${environment}" -n "${DEFAULT_NS}" "${ADOPTED_LABEL}-" >/dev/null 2>&1 \
       && info "Kept environment ${environment}"
   fi
