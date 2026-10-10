@@ -16,9 +16,9 @@
 - [Step 5: Install Agent Sandbox](#step-5-install-agent-sandbox)
 - [Step 6: Install Platform Resources](#step-6-install-platform-resources)
 - [Step 7: Install Observability Extension](#step-7-install-observability-extension)
-- [Step 8: Install Evaluation Extension (Optional)](#step-8-install-evaluation-extension-optional)
+- [Step 8: Install Evaluation Extension](#step-8-install-evaluation-extension)
 - [Step 9: Install API Platform Gateway Extension](#step-9-install-api-platform-gateway-extension)
-- [Step 10: Provision the Environment Identity Provider](#step-10-provision-the-environment-identity-provider)
+- [Step 10: Configure the Environments](#step-10-configure-the-environments)
 - [Verification](#verification)
 - [Access](#access)
 - [Adding Environments](#adding-environments)
@@ -37,7 +37,7 @@ Agent Manager components are distributed across the OpenChoreo planes as shown b
 │   OpenChoreo Control Plane                  │   │   OpenChoreo Data Plane                    │
 │                                             │   │   + Gateway Operator             (Step 3)  │
 │ ns: thunder                                 │   │   + Agent Sandbox RBAC           (Step 5)  │
-│   OpenChoreo Thunder                        │   │   + API Platform Gateway         (Step 9)  │
+│   OpenChoreo Thunder                        │   │   + API Platform Gateways        (Step 10) │
 │   + AMP identities and settings  (Step 1)   │   └────────────────────────────────────────────┘
 │                                             │
 │ ns: wso2-amp                                │   ┌─── Workflow Plane ─────────────────────────┐
@@ -67,7 +67,7 @@ Agent Manager components are distributed across the OpenChoreo planes as shown b
 | Observability Extension | `oci://ghcr.io/wso2/wso2-amp-observability-extension` | `openchoreo-observability-plane` | Yes, for traces, logs, and metrics in the console |
 | Evaluation Extension | `oci://ghcr.io/wso2/wso2-amp-evaluation-extension` | `openchoreo-workflow-plane` | No |
 | API Platform Gateway Extension | `oci://ghcr.io/wso2/wso2-amp-api-platform-gateway-extension` | `openchoreo-data-plane` | Yes |
-| Environment Thunder | Installed by `add-environment-thunder.sh` | `amp-thunder-<org>-<env>` | Yes, for agent identities |
+| Environment Thunder | Installed by `scripts/configure-environments.sh` | `amp-thunder-<org>-<env>` | Yes, for agent identities |
 
 Agent Manager charts are pulled from `oci://ghcr.io/wso2` at version `1.0.0` unless noted otherwise.
 
@@ -148,7 +148,62 @@ export AGENTS_HTTP_PORT="80"
 export AGENTS_HTTPS_PORT="443"
 
 # Registry the workflow plane pushes agent images to
+# (on OpenChoreo's local k3d setup: host.k3d.internal:10082)
 export REGISTRY_ENDPOINT="registry.example.com"
+```
+
+Set your own values after this block, not before: each line here overwrites the variable. To test changes that are not merged yet, point `MODULE_RAW` at your fork's branch, for example `https://raw.githubusercontent.com/<you>/community-modules/refs/heads/<branch>/ai-wso2-agent-manager`.
+
+### Read the Values from OpenChoreo
+
+Instead of editing the domain, port, and Thunder lines by hand, read them from your OpenChoreo installation. Run this after the block above: it takes the Thunder issuer and in-cluster address and the control plane domain from the control plane release, the observability domain from the observability plane release, and the agent domain and ports from the `default` ClusterDataPlane. It then sets the Agent Manager addresses that depend on them and prints the result. Check the printed values; any it could not read are reported, and you set those by hand. `REGISTRY_ENDPOINT` is not recorded by OpenChoreo, so always set it yourself:
+
+```bash
+eval "$(CP_VALUES="$(helm get values openchoreo-control-plane -n "${CONTROL_PLANE_NS}" -a -o json)" \
+  OBS_VALUES="$(helm get values openchoreo-observability-plane -n "${OBSERVABILITY_NS}" -a -o json)" \
+  DP_GATEWAY="$(kubectl get clusterdataplane default -o jsonpath='{.spec.gateway.ingress.external}')" \
+  python3 -c '
+import json, os, shlex, sys
+from urllib.parse import urlsplit
+cp, obs = json.loads(os.environ["CP_VALUES"]), json.loads(os.environ["OBS_VALUES"])
+dp = json.loads(os.environ["DP_GATEWAY"] or "{}")
+def get(d, path):
+    for key in path.split("."):
+        d = d.get(key) if isinstance(d, dict) else None
+    return d
+def domain(wildcard, url):
+    if isinstance(wildcard, str) and wildcard.startswith("*."):
+        return wildcard[2:]
+    host = urlsplit(url or "").hostname or ""
+    return host.split(".", 1)[1] if "." in host else ""
+token_url = urlsplit(get(cp, "security.oidc.tokenUrl") or "")
+values = {
+    "THUNDER_PUBLIC_URL": get(cp, "security.oidc.issuer"),
+    "THUNDER_INTERNAL_HOST": token_url.hostname,
+    "THUNDER_PORT": token_url.port,
+    "THUNDER_NAMESPACE": (token_url.hostname or "").split(".")[1] if (token_url.hostname or "").count(".") >= 2 else None,
+    "CP_BASE_DOMAIN": domain(get(cp, "gateway.tls.hostname"), get(cp, "openchoreoApi.config.server.publicUrl")),
+    "OBS_BASE_DOMAIN": domain(get(obs, "gateway.tls.hostname"), get(cp, "portalAssistant.config.observerApiUrl")),
+    "DP_DOMAIN": get(dp, "https.host") or get(dp, "http.host"),
+    "AGENTS_HTTP_PORT": get(dp, "http.port"),
+    "AGENTS_HTTPS_PORT": get(dp, "https.port"),
+}
+missing = [name for name, value in values.items() if value in (None, "")]
+if missing:
+    print("Could not read " + ", ".join(missing) + "; set them by hand.", file=sys.stderr)
+for name, value in values.items():
+    if value not in (None, ""):
+        print(f"export {name}={shlex.quote(str(value))}")
+')"
+export AMP_CONSOLE_HOST="amp.${CP_BASE_DOMAIN}" AMP_API_HOST="amp-api.${CP_BASE_DOMAIN}"
+export AMP_OBSERVER_HOST="amp-observer.${OBS_BASE_DOMAIN}" AMP_GATEWAY_HOST="default-default.${DP_DOMAIN}"
+export AMP_CONSOLE_URL="https://${AMP_CONSOLE_HOST}" AMP_API_URL="https://${AMP_API_HOST}"
+export AMP_OBSERVER_URL="https://${AMP_OBSERVER_HOST}" INSTRUMENTATION_URL="https://${AMP_GATEWAY_HOST}/otel"
+export THUNDER_INTERNAL_URL="http://${THUNDER_INTERNAL_HOST}:${THUNDER_PORT}"
+for name in CP_BASE_DOMAIN DP_DOMAIN OBS_BASE_DOMAIN AGENTS_HTTP_PORT AGENTS_HTTPS_PORT THUNDER_PUBLIC_URL \
+            THUNDER_NAMESPACE THUNDER_INTERNAL_URL AMP_CONSOLE_URL AMP_API_URL AMP_OBSERVER_URL AMP_GATEWAY_HOST; do
+  printenv "${name}" >/dev/null && echo "${name}=$(printenv "${name}")"
+done
 ```
 
 The Thunder variables assume OpenChoreo's default release, `thunder` in the `thunder` namespace, whose values set `fullnameOverride: thunder` and so name the service `thunder-service`. Confirm the service with `kubectl get svc -n ${THUNDER_NAMESPACE}`, and adjust `THUNDER_NAMESPACE`, `THUNDER_PORT`, and `THUNDER_INTERNAL_HOST` if yours differs; every command in this guide reads them. `THUNDER_PUBLIC_URL` must match the `iss` claim in tokens Thunder issues:
@@ -165,7 +220,8 @@ Identity provisioning ([Step 1](#step-1-configure-identities)), trace ingestion 
 ```bash
 mkdir -p amp-install && cd amp-install
 for f in scripts/provision-thunder-identities.py scripts/merge-collector-config.py scripts/uninstall.sh \
-         scripts/requirements.txt values/thunder-identities.yaml values/agent-manager-v1.yaml \
+         scripts/configure-environments.sh scripts/requirements.txt values/thunder-identities.yaml \
+         values/agent-manager-v1.yaml values/api-platform-gateway-extension.yaml \
          resources/amp-thunder-identities.yaml resources/amp-observer-ingress.yaml resources/rbac.yaml; do
   curl -fsSL --create-dirs -o "${f}" "${MODULE_RAW}/${f}"
 done
@@ -199,7 +255,7 @@ export CURL_CA_BUNDLE="${PWD}/amp-ca-bundle.crt"
 { cat /etc/ssl/cert.pem 2>/dev/null || cat /etc/ssl/certs/ca-certificates.crt; cat "${OPENCHOREO_CA_FILE}"; } > "${CURL_CA_BUNDLE}"
 ```
 
-[Step 10](#step-10-provision-the-environment-identity-provider) passes the same file to the environment Thunder, so every environment trusts the same CA.
+[Step 10](#step-10-configure-the-environments) passes the same file to the environment Thunder, so every environment trusts the same CA.
 
 Keep this shell session and working folder for the whole installation. [Step 1](#step-1-configure-identities) also exports the client secrets used by later steps.
 
@@ -676,7 +732,7 @@ The job's NetworkPolicy allows egress to the Kubernetes API server by address ra
 
 > **Cluster:** Data Plane
 
-Registers an API Platform Gateway with Agent Manager for the default organization and environment. It serves deployed agents at `https://<env>-<org>.${DP_DOMAIN}` (for the default environment and organization, `${AMP_GATEWAY_HOST}`) and carries the OTLP trace-ingest route at `${INSTRUMENTATION_URL}`. Install it last: the bootstrap job needs the Agent Manager API running.
+Each environment gets its own API Platform Gateway, registered with Agent Manager. It serves the environment's deployed agents at `https://<env>-<org>.${DP_DOMAIN}` (for the default environment and organization, `${AMP_GATEWAY_HOST}`), and the default environment's gateway carries the OTLP trace-ingest route at `${INSTRUMENTATION_URL}`. This step prepares what every gateway needs; [Step 10](#step-10-configure-the-environments) installs the gateways, after the Agent Manager API is running.
 
 The bootstrap job authenticates as `amp-api-client`. Store its credentials in a Secret so they stay out of Helm release history:
 
@@ -693,163 +749,68 @@ Agent sandboxes and evaluation jobs reach gateway runtimes only in namespaces la
 kubectl label namespace ${DATA_PLANE_NS} amp.wso2.com/api-platform-gateway=true --overwrite
 ```
 
-Download `values/api-platform-gateway-extension.yaml` and install. `gateway.vhost` is written into Agent Manager at first registration only; a later `helm upgrade` does not change it. `gateway.hostname` sets the host of the gateway's route and follows upgrades, so keep it matching the vhost's host.
+Step 10 installs each gateway from `values/api-platform-gateway-extension.yaml` in the [module tools](#download-the-module-tools) folder. Its address, `gateway.vhost`, is written into Agent Manager at first registration only; a later `helm upgrade` does not change it. `gateway.hostname` sets the host of the gateway's route and follows upgrades.
 
 Agent Manager builds the MCP proxy URLs it injects into agents from `gateway.vhost`. Each URL also serves as the MCP server's OAuth resource identifier, so agents must call it at that exact address, from inside the cluster. Pods must therefore resolve `${AMP_GATEWAY_HOST}` and reach the gateway's HTTPS listener at that address. Otherwise MCP tools fail to load with `Name or service not known` and the agent answers without them. Platform-managed LLM proxies use a separate path: Agent Manager injects the gateway's in-cluster `runtimeUrl` on port 22893, which the sandbox network policy allows to the namespace labelled above, so the requirements in this and the next paragraph do not apply to them.
 
 The agent sandbox's network policy, which the `agent-api` component type defines, allows ports 443 and 80 only to public addresses: it excludes `10.0.0.0/8`, `172.16.0.0/12`, `192.168.0.0/16`, and `169.254.0.0/16`. If `${AMP_GATEWAY_HOST}` resolves to a private address, as an internal load balancer often does on premises, agents cannot reach it and MCP tools fail with `All connection attempts failed`. Agent Manager v1.0.0 does not make this policy configurable; give the data plane gateway an address outside those ranges, or expect agents to run without gateway-managed MCP proxies. Managed LLM proxies are not affected. Agents must also trust the certificate the gateway presents at that address, so use one from a publicly trusted CA.
 
-Install the gateway extension:
-
-```bash
-curl -sOL ${MODULE_RAW}/values/api-platform-gateway-extension.yaml
-
-KM=apiGateway.config.policyConfigurations.jwtauth_v1.keymanagers
-helm install api-platform-default-default \
-  oci://${HELM_CHART_REGISTRY}/wso2-amp-api-platform-gateway-extension \
-  --version ${AMP_VERSION} \
-  --namespace ${DATA_PLANE_NS} \
-  --values api-platform-gateway-extension.yaml \
-  --set agentManager.idp.tokenUrl="${THUNDER_INTERNAL_URL}/oauth2/token" \
-  --set gateway.vhost="https://${AMP_GATEWAY_HOST}" \
-  --set gateway.hostname="${AMP_GATEWAY_HOST}" \
-  --set "${KM}[0].name=agent-manager-service" \
-  --set "${KM}[0].issuer=agent-manager-service" \
-  --set "${KM}[0].jwks.remote.uri=http://amp-api.${AMP_NS}.svc.cluster.local:9000/auth/external/jwks.json" \
-  --set "${KM}[0].jwks.remote.skipTlsVerify=true" \
-  --set "${KM}[1].name=ThunderKeyManager" \
-  --set "${KM}[1].issuer=${THUNDER_PUBLIC_URL}" \
-  --set "${KM}[1].jwks.remote.uri=${THUNDER_INTERNAL_URL}/oauth2/jwks" \
-  --set "${KM}[1].jwks.remote.skipTlsVerify=false" \
-  --timeout 1800s
-
-kubectl wait --for=condition=complete job/api-platform-default-default-bootstrap \
-  -n ${DATA_PLANE_NS} --timeout=300s
-```
-
-Both key managers must be listed: `--set` on an indexed list replaces the whole list, and API-key authentication relies on the `agent-manager-service` entry. [Step 10](#step-10-provision-the-environment-identity-provider) repoints the second entry at the environment's own Thunder.
-
 ---
 
-## Step 10: Provision the Environment Identity Provider
+## Step 10: Configure the Environments
 
 > **Cluster:** Control Plane and Data Plane
 
-Every Agent Manager environment needs its own Thunder instance, which issues each agent its OAuth2 credential (AgentID). This is separate from OpenChoreo's Thunder, which handles console and API login. Without it, agents never get an AgentID and Agent Manager keeps retrying in the background.
+Agent Manager lists every OpenChoreo environment in `${DEFAULT_NS}`: the `default` environment that [Step 6](#step-6-install-platform-resources) created, and any environment that already existed in OpenChoreo. Before agents can run in an environment, it needs two things:
 
-Download the release-pinned script:
+- **An environment Thunder**, which issues each agent its OAuth2 credential (AgentID) and the tokens agents use for OAuth-protected MCP servers. It is separate from OpenChoreo's Thunder, which handles console and API sign-in. Without it, agents never get an AgentID and Agent Manager keeps retrying in the background.
+- **An API Platform Gateway** registered for the environment, which serves its agents and their MCP and LLM proxies, with that environment Thunder as its key manager and identity provider.
 
-```bash
-curl -fsSL "${AMP_RAW}/deployments/scripts/add-environment-thunder.sh" -o add-environment-thunder.sh
-```
+[`scripts/configure-environments.sh`](scripts/configure-environments.sh) gives every environment both, in that order. It skips whatever is already in place, so it is safe to re-run, for example after you create another environment. An environment that existed before Agent Manager keeps its own settings and gets the label `amp.wso2.com/adopted=true`, so [uninstallation](#uninstallation) removes only its Thunder and gateway and keeps the environment.
 
-The environment Thunder must be served the same way as OpenChoreo's Thunder, and must trust the CA that signed OpenChoreo's Thunder certificate. Derive both settings from [Configuration Variables](#configuration-variables) and [Trust the Gateway CA](#trust-the-gateway-ca):
+The environment Thunders are served the same way as OpenChoreo's Thunder, over HTTPS when `THUNDER_PUBLIC_URL` uses it, and trust the CA in `OPENCHOREO_CA_FILE` from [Trust the Gateway CA](#trust-the-gateway-ca), which [Step 2](#step-2-prepare-openchoreo) and the script's own `curl` calls also use. The script reads the `amp-api-client` secret from the Secret created in [Step 9](#step-9-install-api-platform-gateway-extension).
 
-```bash
-# HTTPS when OpenChoreo's Thunder is served over HTTPS
-if [ "${THUNDER_PUBLIC_URL%%:*}" = "https" ]; then
-  export ENV_THUNDER_TLS_ENABLED=true
-else
-  export ENV_THUNDER_TLS_ENABLED=false
-fi
+> **Note:** The environment Thunder only trusts a platform issuer whose JWKS it can fetch over HTTPS; ThunderID allows plain HTTP only for `localhost`, `127.0.0.1`, and `::1`. Otherwise the install fails in its pre-install `setup` job with `trusted_issuer.jwks_url must use https`. The issuer itself may stay HTTP. If OpenChoreo's Thunder is served over plain HTTP, enable an HTTPS listener on the control plane gateway, set `OPENCHOREO_CA_FILE` to its signing CA, and export its HTTPS JWKS URL before running the script, for example `export PLATFORM_THUNDER_JWKS_URL="https://thunder.${CP_BASE_DOMAIN}:8443/oauth2/jwks"`. The script uses `PLATFORM_THUNDER_JWKS_URL` when it is set.
 
-# Mount OpenChoreo's private CA when there is one; otherwise skip CA handling
-if [ -n "${OPENCHOREO_CA_FILE}" ]; then
-  export PLATFORM_THUNDER_CA_PEM="$(cat "${OPENCHOREO_CA_FILE}")" SKIP_CA_BUNDLE_TRUST=false
-else
-  export PLATFORM_THUNDER_CA_PEM="" SKIP_CA_BUNDLE_TRUST=true
-fi
-echo "TLS_ENABLED=${ENV_THUNDER_TLS_ENABLED} SKIP_CA_BUNDLE_TRUST=${SKIP_CA_BUNDLE_TRUST}"
-```
-
-With the self-signed `openchoreo-ca`, this prints `TLS_ENABLED=true SKIP_CA_BUNDLE_TRUST=false`. With a publicly trusted certificate, where `OPENCHOREO_CA_FILE` is empty, it skips the CA flow. With a plain-HTTP Thunder, it also turns TLS off. The script's own `curl` calls use `CURL_CA_BUNDLE`.
-
-> **Note:** The environment Thunder only trusts a platform issuer whose JWKS it can fetch over HTTPS; ThunderID allows plain HTTP only for `localhost`, `127.0.0.1`, and `::1`. Otherwise the install fails in its pre-install `setup` job with `trusted_issuer.jwks_url must use https`. The issuer itself may stay HTTP. If OpenChoreo's Thunder is served over plain HTTP, enable an HTTPS listener on the control plane gateway, set `OPENCHOREO_CA_FILE` to its signing CA, and export its HTTPS JWKS URL before running the script, for example `export PLATFORM_THUNDER_JWKS_URL="https://thunder.${CP_BASE_DOMAIN}:8443/oauth2/jwks"`. The command below uses `PLATFORM_THUNDER_JWKS_URL` when it is set.
-
-Run the script. `IDP_CLIENT_SECRET` must be the real `amp-api-client` secret; the script's default is the shipped placeholder:
+Run it from the [module tools](#download-the-module-tools) folder, with the [Configuration Variables](#configuration-variables) exported. Set `ENVIRONMENTS` to a space-separated list to configure only those environments:
 
 ```bash
-ENV_NAME=default \
-DISPLAY_NAME="Default" \
-ORG_NAME=default \
-THUNDER_HANDLE=default-idp \
-WAIT_TIMEOUT=300s \
-CHART_VERSION=1.0.0 \
-SCRIPT_BASE_URL="${AMP_RAW}/deployments/scripts" \
-AMP_API_URL="${AMP_API_URL}/api/v1" \
-IDP_TOKEN_URL="${THUNDER_PUBLIC_URL}/oauth2/token" \
-IDP_CLIENT_ID=amp-api-client \
-IDP_CLIENT_SECRET="${AMP_API_CLIENT_SECRET}" \
-AGENT_MANAGER_TOKEN="" \
-PLATFORM_THUNDER_ISSUER="${THUNDER_PUBLIC_URL}" \
-PLATFORM_THUNDER_JWKS_URL="${PLATFORM_THUNDER_JWKS_URL:-${THUNDER_PUBLIC_URL}/oauth2/jwks}" \
-PLATFORM_THUNDER_CA_PEM="${PLATFORM_THUNDER_CA_PEM}" \
-SKIP_CA_BUNDLE_TRUST="${SKIP_CA_BUNDLE_TRUST}" \
-THUNDER_HOST_BASE_DOMAIN="${CP_BASE_DOMAIN}" \
-TLS_ENABLED="${ENV_THUNDER_TLS_ENABLED}" \
-bash add-environment-thunder.sh
+bash scripts/configure-environments.sh
 ```
 
-The script prints the environment's issuer: `https://default-idp.${CP_BASE_DOMAIN}` with TLS, or `http://default-idp.${CP_BASE_DOMAIN}:8080` without. `CHART_VERSION` is the ThunderID chart and image version, not the Agent Manager version. `AGENT_MANAGER_TOKEN=""` makes it request a new token with the `IDP_*` values: it otherwise reuses an exported `AGENT_MANAGER_TOKEN`, and a token from an earlier session fails with `Could not register the thunder url handle in agent-manager-service (HTTP 401)`. It is safe to re-run; the system-client secret and admin password are reused, never rotated. Retrieve the environment Thunder's admin password with:
+For each environment it reports the Thunder and the gateway, then a summary. With only the default environment:
+
+```text
+=== Environment default ===
+  Installing ThunderID amp-thunder-default-default...
+  ThunderID ready at https://default-idp.openchoreo.localhost
+  Installing gateway api-platform-default-default...
+  Gateway ready: https://default-default.openchoreoapis.localhost
+
+=== Summary ===
+  default: ready (gateway https://default-default.openchoreoapis.localhost, ThunderID https://default-idp.openchoreo.localhost)
+```
+
+It exits with an error, and prints the end of the failing command's output, if an environment could not be completed; fix the cause and run it again. Verify the gateways and environments. Each gateway should report `Accepted=True Programmed=True`, and existing environments show `true` under `ADOPTED`:
 
 ```bash
-kubectl get secret amp-thunder-default-default-admin-credentials \
-  -n amp-thunder-default-default -o jsonpath='{.data.password}' | base64 -d
+kubectl get apigateway -n ${DATA_PLANE_NS} \
+  -o custom-columns='NAME:.metadata.name,STATUS:.status.conditions[*].status'
+kubectl get environments.openchoreo.dev -n ${DEFAULT_NS} -L amp.wso2.com/adopted
 ```
 
-### Point the Gateway at the Environment Thunder
-
-Register the environment Thunder with the gateway, both as a key manager that validates agents' OAuth tokens and as an identity provider shown in the console:
+Each environment Thunder has its own administrator, `admin`, for administering that Thunder only. Read its password with:
 
 ```bash
-export ENV_THUNDER_RELEASE="amp-thunder-default-default"
-# Must equal the Issuer the script printed
-if [ "${ENV_THUNDER_TLS_ENABLED}" = "true" ]; then
-  export ENV_THUNDER_ISSUER="https://default-idp.${CP_BASE_DOMAIN}"
-else
-  export ENV_THUNDER_ISSUER="http://default-idp.${CP_BASE_DOMAIN}:8080"
-fi
-export ENV_THUNDER_JWKS="http://${ENV_THUNDER_RELEASE}-service.${ENV_THUNDER_RELEASE}.svc.cluster.local:8090/oauth2/jwks"
-
-KM=apiGateway.config.policyConfigurations.jwtauth_v1.keymanagers
-helm upgrade api-platform-default-default \
-  oci://${HELM_CHART_REGISTRY}/wso2-amp-api-platform-gateway-extension \
-  --version ${AMP_VERSION} \
-  --namespace ${DATA_PLANE_NS} \
-  --reuse-values \
-  --set "${KM}[0].name=agent-manager-service" \
-  --set "${KM}[0].issuer=agent-manager-service" \
-  --set "${KM}[0].jwks.remote.uri=http://amp-api.${AMP_NS}.svc.cluster.local:9000/auth/external/jwks.json" \
-  --set "${KM}[0].jwks.remote.skipTlsVerify=true" \
-  --set "${KM}[1].name=ThunderKeyManager" \
-  --set "${KM}[1].issuer=${ENV_THUNDER_ISSUER}" \
-  --set "${KM}[1].jwks.remote.uri=${ENV_THUNDER_JWKS}" \
-  --set "${KM}[1].jwks.remote.skipTlsVerify=false" \
-  --set "bootstrap.identityProviders[0].name=ThunderKeyManager" \
-  --set "bootstrap.identityProviders[0].issuer=${ENV_THUNDER_ISSUER}" \
-  --set "bootstrap.identityProviders[0].jwksUri=${ENV_THUNDER_JWKS}" \
-  --set "bootstrap.identityProviders[0].skipTlsVerify=false" \
-  --timeout 900s
+kubectl get secret amp-thunder-default-<env>-admin-credentials \
+  -n amp-thunder-default-<env> -o jsonpath='{.data.password}' | base64 -d
 ```
 
-Use the issuer the script printed if you chose a different `THUNDER_HANDLE`. Without this step agents still accept API keys, but no agent endpoint can validate an OAuth token, and the console's gateway page shows *No identity providers configured*.
-
-Verify that the gateway picked up the environment Thunder:
+When the script updates an existing gateway, it restarts the gateway controller, whose volume is `ReadWriteOnce`. On a multi-node cluster the new pod can stick in `ContainerCreating` with `Multi-Attach error for volume`; delete the old controller pod to release it:
 
 ```bash
-kubectl rollout status deployment/api-platform-default-default-gw-gateway-controller \
-  -n ${DATA_PLANE_NS} --timeout=300s
-
-# Expect Accepted=True Programmed=True
-kubectl get apigateway api-platform-default-default -n ${DATA_PLANE_NS} \
-  -o jsonpath='{range .status.conditions[*]}{.type}={.status} {end}{"\n"}'
-
-# Expect both key managers, the second with issuer ${ENV_THUNDER_ISSUER}
-helm get values api-platform-default-default -n ${DATA_PLANE_NS} -o json \
-  | python3 -c 'import json,sys; [print(k["name"], k["issuer"]) for k in json.load(sys.stdin)["apiGateway"]["config"]["policyConfigurations"]["jwtauth_v1"]["keymanagers"]]'
+kubectl get pods -n ${DATA_PLANE_NS} | grep gateway-controller
 ```
-
-This upgrade restarts the gateway controller, whose volume is `ReadWriteOnce`. On a multi-node cluster the new pod can stick in `ContainerCreating` with `Multi-Attach error for volume`; delete the old controller pod to release it:
 
 ```bash
 kubectl get pods -n ${DATA_PLANE_NS} | grep gateway-controller
@@ -927,78 +888,46 @@ for user_id in admins:
         print("  ", user_id, "is not in the Thunder bootstrap values; use the OpenChoreo password of that user")'
 ```
 
-The sample passwords are for evaluation; change them before you share the installation. The environment Thunder's own administrator, `admin`, is only for administering that Thunder; [Step 10](#step-10-provision-the-environment-identity-provider) shows how to read its password.
+The sample passwords are for evaluation; change them before you share the installation. The environment Thunder's own administrator, `admin`, is only for administering that Thunder; [Step 10](#step-10-configure-the-environments) shows how to read its password.
 
 ---
 
 ## Adding Environments
 
-Additional environments are created from the Console (**Deployment Pipelines → Environments → Create Environment**), which generates an `add-environment.sh` command to run in a terminal with `kubectl` and `helm` configured. The self-hosted release has no automatic provisioning; on Agent Manager Cloud, WSO2 runs the equivalent automation.
+To add an environment, create it in OpenChoreo, then re-run [Step 10](#step-10-configure-the-environments) for it. Do not use the command that the Console's **Create Environment** generates on this setup: it installs the environment's gateway in another namespace and without the identity settings this module uses.
 
-The generated command assumes Agent Manager's own installation layout, not this module's. On this module's setup it needs corrections before and after running it.
-
-**Before running the command**, export the gateway placement in the same shell. The script installs each environment's gateway in its own `<org>-<env>` namespace by default, but [Step 6](#step-6-install-platform-resources) sets `apiPlatformGateway.namespace` to `${DATA_PLANE_NS}`, so agents address every environment's gateway there. A gateway anywhere else leaves the agent without a route: **Try It** reports `The request was not authorized` (the gateway route answers `503 no healthy upstream`), and the agent's traces are dropped. The other settings give the gateway the same `https://<env>-<org>.${DP_DOMAIN}` address as the default environment. The script registers that address with Agent Manager once, and a reinstall does not change it:
+Create the environment in `${DEFAULT_NS}`, on the data plane that Step 10's gateways serve:
 
 ```bash
-export GATEWAY_NAMESPACE="${DATA_PLANE_NS}"
-export GATEWAY_BASE_DOMAIN="${DP_DOMAIN}" GATEWAY_VHOST_SCHEME=https GATEWAY_VHOST_PORT=443
+cat <<EOF | kubectl apply -f -
+apiVersion: openchoreo.dev/v1alpha1
+kind: Environment
+metadata:
+  name: staging
+  namespace: ${DEFAULT_NS}
+  annotations:
+    openchoreo.dev/display-name: Staging
+spec:
+  dataPlaneRef:
+    kind: ClusterDataPlane
+    name: default
+  isProduction: false
+EOF
 ```
 
-Also export the platform Thunder settings. The generated command passes exported variables through to the environment Thunder script. Without them, the environment Thunder trusts a local-development issuer (`http://thunder.amp.localhost:8080`) instead of OpenChoreo's Thunder:
+Then give it a Thunder and a gateway:
 
 ```bash
-export PLATFORM_THUNDER_ISSUER="${THUNDER_PUBLIC_URL}"
-export PLATFORM_THUNDER_JWKS_URL="${PLATFORM_THUNDER_JWKS_URL:-${THUNDER_PUBLIC_URL}/oauth2/jwks}"
+ENVIRONMENTS=staging bash scripts/configure-environments.sh
 ```
 
-Also export `PLATFORM_THUNDER_CA_PEM` and `SKIP_CA_BUNDLE_TRUST` as in [Step 10](#step-10-provision-the-environment-identity-provider).
-
-The generated command carries your Console access token inline as `AGENT_MANAGER_TOKEN`, and both scripts use it for every Agent Manager call. Copy the command from the Console just before you run it: a command copied earlier fails with `HTTP 401` once that token expires.
-
-**After running the command**, complete the environment's gateway. The script installs the environment's API Platform Gateway without the bootstrap identity settings, so its bootstrap job requests a token from Agent Manager's own Thunder service, which does not exist here. The install then fails with `job api-platform-<org>-<env>-bootstrap failed: BackoffLimitExceeded`. Run this only after the Console's command has finished; it repairs the release that command installed. If `helm get values` reports `release: not found`, the command has not run, or it ran with a different `GATEWAY_NAMESPACE`. Reinstall the release with the script's values plus the identity settings. The chart enables development mode by default and the script does not turn it off, so the command also sets `developmentMode=false`, as [Step 9](#step-9-install-api-platform-gateway-extension) does for the default gateway. It reuses the `gateway-idp-credentials` Secret from [Step 9](#step-9-install-api-platform-gateway-extension). Set `NEW_ENV` to the environment's name:
-
-```bash
-export NEW_ENV="staging"
-export NEW_ENV_NS="${DATA_PLANE_NS}" NEW_ENV_RELEASE="api-platform-default-${NEW_ENV}"
-
-# Keep the values the script set, remove the failed release, and reinstall it.
-# The chain stops at the first failure, so nothing is installed if the
-# environment's release does not exist yet.
-helm get values ${NEW_ENV_RELEASE} -n ${NEW_ENV_NS} -o yaml > ${NEW_ENV_RELEASE}-values.yaml \
-&& helm uninstall ${NEW_ENV_RELEASE} -n ${NEW_ENV_NS} \
-&& helm install ${NEW_ENV_RELEASE} \
-  oci://${HELM_CHART_REGISTRY}/wso2-amp-api-platform-gateway-extension \
-  --version ${AMP_VERSION} \
-  --namespace ${NEW_ENV_NS} \
-  --values ${NEW_ENV_RELEASE}-values.yaml \
-  --set agentManager.idp.tokenUrl="${THUNDER_INTERNAL_URL}/oauth2/token" \
-  --set agentManager.idp.existingSecret=gateway-idp-credentials \
-  --set apiGateway.namespace="${NEW_ENV_NS}" \
-  --set developmentMode=false \
-  --timeout 1800s \
-&& kubectl wait --for=condition=complete job/${NEW_ENV_RELEASE}-bootstrap \
-  -n ${NEW_ENV_NS} --timeout=300s
-```
-
-Verify the environment. Expect `Accepted=True Programmed=True`, and the trusted issuer `${THUNDER_PUBLIC_URL}`:
-
-```bash
-kubectl get apigateway ${NEW_ENV_RELEASE} -n ${NEW_ENV_NS} \
-  -o jsonpath='{range .status.conditions[*]}{.type}={.status} {end}{"\n"}'
-
-helm get values amp-thunder-default-${NEW_ENV} -n amp-thunder-default-${NEW_ENV} -o json \
-  | python3 -c 'import json,sys; print(json.load(sys.stdin)["configuration"]["server"]["security"]["trustedIssuer"]["issuer"])'
-```
-
-**Finally, add the environment to a deployment pipeline.** An agent's Deploy page shows only the environments in its project's pipeline, and creating an environment does not add it to one. The `default` pipeline contains only the `default` environment. It is managed by the `amp-platform-resources` Helm release, so a later `helm upgrade` of that release resets it; create a separate pipeline instead:
+**Then add the environment to a deployment pipeline.** An agent's Deploy page shows only the environments in its project's pipeline, and creating an environment does not add it to one. The `default` pipeline contains only the `default` environment. It is managed by the `amp-platform-resources` Helm release, so a later `helm upgrade` of that release resets it; create a separate pipeline instead:
 
 1. In the Console, open **Deployment Pipelines** (organization level, **INFRASTRUCTURE**) and click **Create Pipeline**.
 2. Add the environments in promotion order, for example **Default → Staging**, and click **Create**.
 3. Open **Projects**, choose **Edit** on the project, select the new pipeline under **Deployment Pipeline**, and click **Update Project**.
 
 Agents in the project can then be promoted from the first environment to the next.
-
-If the environment was already created without the exported settings, re-run the Step 10 `add-environment-thunder.sh` command with `ENV_NAME`, `DISPLAY_NAME`, and `THUNDER_HANDLE` set to that environment's values. It is safe to re-run: it keeps the environment's secrets and updates the trusted issuer.
 
 ---
 
@@ -1008,8 +937,8 @@ If the environment was already created without the exported settings, re-run the
 
 | Step | What it removes |
 |---|---|
-| 1 | Through the Agent Manager API, while it is still running: all agents and the projects that held them, the environments added for Agent Manager with their environment Thunder and gateway, and the pipelines that reference only Agent Manager environments. It returns the `default` pipeline to the `default` environment only, because an environment that a pipeline references cannot be deleted. Other projects, environments, and pipelines are listed and kept |
-| 2 | The default environment's Thunder and API Platform Gateway, the `gateway-idp-credentials` Secret, and the gateway namespace label |
+| 1 | Through the Agent Manager API, while it is still running: all agents and the projects that held them, the environments added through Agent Manager's own environment script with their environment Thunder and gateway, and the pipelines that reference only Agent Manager environments. It returns the `default` pipeline to the `default` environment only, because an environment that a pipeline references cannot be deleted. Environments labelled `amp.wso2.com/adopted=true` by [Step 10](#step-10-configure-the-environments), other projects, and pipelines of only those environments are kept |
+| 2 | The environment Thunder and gateway of the `default` environment and of each adopted environment, the `gateway-idp-credentials` Secret, and the gateway namespace label. Adopted environments themselves are kept, without the label |
 | 3 | The evaluation, observability, platform resources, and core releases, the `${AMP_NS}` namespace, and the observer ingress policy. Agent Sandbox, including the upstream controller, RBAC, and CRDs that its chart applies outside Helm, and the Gateway Operator with its CRDs. Each is kept while resources of its types remain after Agent Manager's own are gone, because deleting a CRD deletes every resource of that type. Also what `helm uninstall` leaves behind: the `amp-monitor-evaluation` workflow template, each removed gateway's bootstrap Job and RBAC, registration token Secret, and controller TLS Secret, the monitor runs, the workflow-plane objects (Argo workflows, ExternalSecrets, Secrets) that deleted build and monitor runs leave behind, and the OpenChoreo access Agent Manager grants its runtime clients |
 | 4 | Points the tracing module back at its own collector configuration and, once that succeeds, deletes the merged copy, and deletes the two Agent Manager client secrets from OpenBao. `secret/workflow-plane-oauth-client-secret` is kept for OpenChoreo's builds. Also the secrets Agent Manager stored through OpenChoreo's secret management (agent API keys and identities, agent environment variables, MCP and LLM proxy keys, monitor credentials), with their SecretReferences, PushSecrets, and OpenBao keys. They are recognized by Agent Manager's label and naming, including names that start with an agent's name |
 | 5 | The Agent Manager identities and shared-setting changes in OpenChoreo's Thunder, with the `remove` command from [IDENTITY.md](IDENTITY.md#remove-the-identities). A new installation requires this: the Step 1 import refuses to overwrite existing identities |
@@ -1018,8 +947,18 @@ Run it from the [module tools](#download-the-module-tools) folder, with the [Con
 
 ```bash
 export AMP_IDENTITY_CONFIG="${AMP_IDENTITY_WORK}/configuration.yaml"
-export OPENCHOREO_SYSTEM_APP_SECRET="<openchoreo-system-app client secret>"
+export OPENCHOREO_SYSTEM_APP_SECRET="$(helm get values thunder -n "${THUNDER_NAMESPACE}" -a -o json | python3 -c '
+import json, re, sys
+scripts = (json.load(sys.stdin).get("bootstrap") or {}).get("scripts") or {}
+for text in scripts.values():
+    m = re.search(r"clientId:\s*openchoreo-system-app\s*\n\s*clientSecret:\s*\"?([^\s\"]+)", text)
+    if m:
+        print(m.group(1)); break
+else:
+    sys.exit("openchoreo-system-app is not in the Thunder bootstrap values; set OPENCHOREO_SYSTEM_APP_SECRET by hand")')"
 ```
+
+The second command reads the secret from the Thunder release, as in [IDENTITY.md](IDENTITY.md#1-collect-the-existing-identity-configuration).
 
 The script reads the Agent Manager client secret from the cluster when `AMP_API_CLIENT_SECRET` is not set, and uses `BAO_TOKEN` (default `root`) for OpenBao. Agent Sandbox and the Gateway Operator may be shared with other modules; set `KEEP_AGENT_SANDBOX=true` or `KEEP_GATEWAY_OPERATOR=true` to keep them even when nothing else uses them. Run the script and type `uninstall` when asked, or pass `--yes`:
 

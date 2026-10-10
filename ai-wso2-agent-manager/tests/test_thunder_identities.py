@@ -348,6 +348,22 @@ class IdentityTests(unittest.TestCase):
         handlers = [h for h in client.opener.handlers if isinstance(h, provision.HTTPSHandler)]
         self.assertTrue(handlers and handlers[0]._context.verify_mode == provision.ssl.CERT_REQUIRED)
 
+    def test_remove_rejects_the_unfilled_template(self):
+        template = self.path / "template.yaml"
+        template.write_text((ROOT / "values/thunder-identities.yaml").read_text())
+        with self.assertRaises(provision.ProvisionError) as error:
+            provision.load_removal_inputs(template)
+        self.assertIn("unfilled template", str(error.exception))
+
+    def test_missing_bundle_names_the_file(self):
+        missing = self.path / "not-rendered"
+        stderr = io.StringIO()
+        argv = ["provision", "dry-run", "--bundle-dir", str(missing), "--thunder-url", "https://id.company.test"]
+        with patch.object(provision.sys, "argv", argv), patch.object(provision.sys, "stderr", stderr):
+            self.assertEqual(provision.main(), 1)
+        self.assertIn(str(missing / "deployment.json"), stderr.getvalue())
+        self.assertIn("Render the bundle", stderr.getvalue())
+
     def test_http_and_redirects_do_not_leak_credentials(self):
         with self.assertRaises(provision.ProvisionError):
             provision.Thunder("http://id.company.test", "token")

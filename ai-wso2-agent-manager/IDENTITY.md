@@ -42,11 +42,23 @@ Thunder's System resource identifier must be `<thunder-public-url>/mcp`, matchin
 
 Back up existing identity configuration and keep the same issuer and signing keys. The tool needs a system-scoped administrative token in `THUNDER_ADMIN_TOKEN`. Do not place tokens in Git or command-line arguments.
 
-OpenChoreo v1.3.x registers an `openchoreo-system-app` client for this purpose: it uses client credentials and holds the `system` permission on the System resource server. Request a token from it with the System resource identifier as the `resource`. Set `THUNDER_PUBLIC_URL` to the issuer, and set the client secret from the Thunder values OpenChoreo was installed with. The reference installation uses `openchoreo-system-app-secret`; an empty value fails with HTTP 401:
+OpenChoreo v1.3.x registers an `openchoreo-system-app` client for this purpose: it uses client credentials and holds the `system` permission on the System resource server. Request a token from it with the System resource identifier as the `resource`. Set `THUNDER_PUBLIC_URL` to the issuer.
+
+The client and its secret belong to OpenChoreo, not to Agent Manager: whoever installed OpenChoreo set the secret in the Thunder Helm values (the `55-system-app.yaml` bootstrap file). Helm keeps those values in the cluster, so read the secret from the Thunder release. This does not print it:
 
 ```bash
-export OPENCHOREO_SYSTEM_APP_SECRET="openchoreo-system-app-secret"
+export OPENCHOREO_SYSTEM_APP_SECRET="$(helm get values thunder -n "${THUNDER_NAMESPACE}" -a -o json | python3 -c '
+import json, re, sys
+scripts = (json.load(sys.stdin).get("bootstrap") or {}).get("scripts") or {}
+for text in scripts.values():
+    m = re.search(r"clientId:\s*openchoreo-system-app\s*\n\s*clientSecret:\s*\"?([^\s\"]+)", text)
+    if m:
+        print(m.group(1)); break
+else:
+    sys.exit("openchoreo-system-app is not in the Thunder bootstrap values; set OPENCHOREO_SYSTEM_APP_SECRET by hand")')"
 ```
+
+If your Thunder was installed without the bootstrap files, ask whoever installed OpenChoreo for the secret and export it instead. The reference installation uses `openchoreo-system-app-secret`. An empty or wrong value makes the token request below fail with HTTP 401.
 
 ```bash
 export THUNDER_ADMIN_TOKEN=$(curl -fsS -X POST "${THUNDER_PUBLIC_URL}/oauth2/token" \
@@ -79,13 +91,37 @@ echo "Users (ID, user type, username):"
 thunder_get '/users?limit=100' | python3 -c 'import json,sys; [print(" ", u["id"], "|", u.get("type"), "|", (u.get("attributes") or {}).get("username")) for u in json.load(sys.stdin)["users"]]'
 ```
 
-From the listings, export three more values:
+Then choose two things from the listings, and let the next block turn them into IDs:
 
-- `AMP_AUTH_FLOW_ID`: the login flow ID of the client OpenChoreo's console signs in with. On OpenChoreo's reference installation, that is the `Backstage` client.
-- `AMP_ALLOWED_USER_TYPES`: the user types that client allows, separated by spaces. Optional; the default is `openchoreo-user`. Step 2 always adds `engineer`.
-- `AMP_ADMIN_USER_IDS`: the IDs of the users who should administer AMP, separated by spaces.
+- `AMP_CONSOLE_CLIENT_NAME`: the client OpenChoreo's console signs in with. On OpenChoreo's reference installation, that is `Backstage`. Its login flow and allowed user types become AMP's.
+- `AMP_ADMIN_USERNAMES`: the usernames of the users who should administer AMP, separated by spaces. On the reference installation, `admin@openchoreo.dev` is an existing administrator.
 
-For example, `export AMP_AUTH_FLOW_ID="<login flow ID>" AMP_ADMIN_USER_IDS="<user ID>"`, with the IDs from the listings.
+The block exports `AMP_AUTH_FLOW_ID`, `AMP_ALLOWED_USER_TYPES`, and `AMP_ADMIN_USER_IDS`, and prints them. It stops with a message if the client or a username does not exist; correct the name and run it again:
+
+```bash
+export AMP_CONSOLE_CLIENT_NAME="Backstage"
+export AMP_ADMIN_USERNAMES="admin@openchoreo.dev"
+
+AMP_CONSOLE_CLIENT_ID="$(thunder_get '/applications?limit=100' | python3 -c '
+import json, os, sys
+name = os.environ["AMP_CONSOLE_CLIENT_NAME"]
+ids = [a["id"] for a in json.load(sys.stdin)["applications"] if a["name"] == name]
+print(ids[0]) if ids else sys.exit(f"No Thunder client is named {name}; set AMP_CONSOLE_CLIENT_NAME from the listing above.")')"
+eval "$(thunder_get "/applications/${AMP_CONSOLE_CLIENT_ID}" | python3 -c '
+import json, shlex, sys
+app = json.load(sys.stdin)
+print("export AMP_AUTH_FLOW_ID=" + shlex.quote(app["authFlowId"]))
+print("export AMP_ALLOWED_USER_TYPES=" + shlex.quote(" ".join(app.get("allowedUserTypes") or [])))')"
+eval "$(thunder_get '/users?limit=100' | python3 -c '
+import json, os, shlex, sys
+wanted = os.environ["AMP_ADMIN_USERNAMES"].replace(",", " ").split()
+users = {(u.get("attributes") or {}).get("username"): u["id"] for u in json.load(sys.stdin)["users"]}
+missing = [name for name in wanted if name not in users]
+if missing:
+    sys.exit("No Thunder user is named " + ", ".join(missing) + "; set AMP_ADMIN_USERNAMES from the listing above.")
+print("export AMP_ADMIN_USER_IDS=" + shlex.quote(" ".join(users[name] for name in wanted)))')"
+echo "AMP_AUTH_FLOW_ID=${AMP_AUTH_FLOW_ID}  AMP_ALLOWED_USER_TYPES=${AMP_ALLOWED_USER_TYPES}  AMP_ADMIN_USER_IDS=${AMP_ADMIN_USER_IDS}"
+```
 
 ## 2. Prepare the configuration and client secrets
 

@@ -346,6 +346,9 @@ def load_removal_inputs(config_path):
     """
     config = yaml.safe_load(config_path.read_text())
     require(isinstance(config, dict), "Configuration must be a YAML mapping.")
+    require(not str(config.get("organizationUnitId", "")).startswith("<"),
+            "The configuration is the unfilled template, so it cannot identify what to remove. Use the "
+            "configuration the identities were imported with; if they were never imported, nothing needs removing.")
     for key in ("organizationUnitId", "organizationUnitHandle", "systemResourceServerId"):
         required_text(config, key)
     for key in ("thunderPublicUrl", "consolePublicUrl"):
@@ -461,8 +464,17 @@ def main():
                 import_bundle(client, config, documents, apply=args.command == "apply")
     except (ProvisionError, OSError, ValueError, KeyError, TypeError, yaml.YAMLError) as error:
         # Only controlled errors are safe to print; parser exceptions can
-        # include source lines containing credentials.
-        print(str(error) if isinstance(error, ProvisionError) else "Invalid input or filesystem error; details omitted to protect credentials.", file=sys.stderr)
+        # include source lines containing credentials. A missing file's path
+        # is safe and tells the operator which step to run.
+        if isinstance(error, ProvisionError):
+            message = str(error)
+        elif isinstance(error, FileNotFoundError) and error.filename:
+            message = f"File not found: {error.filename}."
+            if Path(error.filename).name in ("deployment.json", "identities.yaml"):
+                message += " Render the bundle into that directory first, and check AMP_IDENTITY_WORK."
+        else:
+            message = "Invalid input or filesystem error; details omitted to protect credentials."
+        print(message, file=sys.stderr)
         return 1
     return 0
 

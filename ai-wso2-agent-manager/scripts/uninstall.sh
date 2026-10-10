@@ -115,6 +115,13 @@ amp_environment() {
   kubectl get namespace "amp-thunder-${ORG_NAME}-$1" >/dev/null 2>&1 \
     || grep -qx "api-platform-${ORG_NAME}-$1" <<<"${helm_releases}"
 }
+# Environments that existed in OpenChoreo before Agent Manager, labelled by
+# configure-environments.sh. They are kept; step 2 removes only their ThunderID
+# and gateway.
+ADOPTED_LABEL="amp.wso2.com/adopted"
+adopted_environments="$(kubectl get environments.openchoreo.dev -n "${DEFAULT_NS}" -l "${ADOPTED_LABEL}=true" \
+  -o jsonpath='{range .items[*]}{.metadata.name}{"\n"}{end}' 2>/dev/null || true)"
+is_adopted() { grep -qx "$1" <<<"${adopted_environments}"; }
 
 # --- 1. Agents, projects, pipelines, and additional environments -------------
 step "1. Agents, projects, pipelines, and additional environments"
@@ -227,7 +234,9 @@ import json, sys
 print("\n".join(json.loads(line)["name"] for line in sys.stdin if line.strip()))')"; then
     for environment in ${all_environments}; do
       [ "${environment}" = "default" ] && continue
-      if amp_environment "${environment}"; then
+      if is_adopted "${environment}"; then
+        info "Keeping environment ${environment}: it existed before Agent Manager (step 2 removes its ThunderID and gateway)"
+      elif amp_environment "${environment}"; then
         environments="${environments} ${environment}"
       else
         info "Keeping environment ${environment}: Agent Manager did not create it"
@@ -238,11 +247,14 @@ print("\n".join(json.loads(line)["name"] for line in sys.stdin if line.strip()))
   fi
 
   # An environment cannot be deleted while a pipeline references it. Delete the
-  # pipelines that reference only Agent Manager environments, and return the
-  # default pipeline to its installed state.
-  if pipelines="$(list_all /deployment-pipelines deploymentPipelines 50 | AMP_ENVIRONMENTS="default ${environments}" python3 -c '
+  # pipelines that reference Agent Manager's environments and no others, besides
+  # adopted ones, and return the default pipeline to its installed state. A
+  # pipeline of adopted environments only belongs to OpenChoreo and is kept.
+  if pipelines="$(list_all /deployment-pipelines deploymentPipelines 50 | AMP_ENVIRONMENTS="default ${environments}" \
+    ADOPTED_ENVIRONMENTS="${adopted_environments}" python3 -c '
 import json, os, sys
 amp = set(os.environ["AMP_ENVIRONMENTS"].split())
+adopted = set(os.environ["ADOPTED_ENVIRONMENTS"].split())
 for line in sys.stdin:
     if not line.strip():
         continue
@@ -256,7 +268,7 @@ for line in sys.stdin:
     refs.discard(None)
     if p["name"] == "default":
         print("reset default")
-    elif refs and refs <= amp:
+    elif refs and refs <= amp | adopted and refs & amp:
         print("delete " + p["name"])
     else:
         print("keep " + p["name"])')"; then
@@ -301,21 +313,35 @@ else
   info "Skipping agents, projects, pipelines, and additional environments; remove them manually if any remain."
 fi
 
-# --- 2. Default environment --------------------------------------------------
-step "2. Default environment"
-if [ -n "${AMP_API_CLIENT_SECRET}" ] && kubectl get namespace "amp-thunder-${ORG_NAME}-default" >/dev/null 2>&1; then
-  if curl -fsSL --max-time 60 "${SCRIPT_BASE_URL}/remove-environment-thunder.sh" -o "${WORK}/remove-environment-thunder.sh"; then
-    ENV_NAME=default ORG_NAME="${ORG_NAME}" SCRIPT_BASE_URL="${SCRIPT_BASE_URL}" \
-    AMP_API_URL="${AMP_API_URL}/api/v1" IDP_TOKEN_URL="${THUNDER_PUBLIC_URL}/oauth2/token" \
-    IDP_CLIENT_ID=amp-api-client IDP_CLIENT_SECRET="${AMP_API_CLIENT_SECRET}" \
-    bash "${WORK}/remove-environment-thunder.sh" || warn "Could not fully remove the default environment Thunder"
+# --- 2. Default and adopted environments -------------------------------------
+# Their ThunderID and gateway. The default environment itself goes with the
+# platform resources release in step 3; adopted environments are kept.
+step "2. Default and adopted environments"
+thunder_script=""
+for environment in default ${adopted_environments}; do
+  if kubectl get namespace "amp-thunder-${ORG_NAME}-${environment}" >/dev/null 2>&1; then
+    if [ -z "${AMP_API_CLIENT_SECRET}" ]; then
+      warn "No amp-api-client secret; the ${environment} environment ThunderID was not removed"
+    elif [ -z "${thunder_script}" ] && ! curl -fsSL --max-time 60 "${SCRIPT_BASE_URL}/remove-environment-thunder.sh" \
+        -o "${WORK}/remove-environment-thunder.sh"; then
+      warn "Could not download remove-environment-thunder.sh; the ${environment} environment ThunderID was not removed"
+    else
+      thunder_script="${WORK}/remove-environment-thunder.sh"
+      ENV_NAME="${environment}" ORG_NAME="${ORG_NAME}" SCRIPT_BASE_URL="${SCRIPT_BASE_URL}" \
+      AMP_API_URL="${AMP_API_URL}/api/v1" IDP_TOKEN_URL="${THUNDER_PUBLIC_URL}/oauth2/token" \
+      IDP_CLIENT_ID=amp-api-client IDP_CLIENT_SECRET="${AMP_API_CLIENT_SECRET}" \
+      bash "${thunder_script}" >/dev/null 2>&1 && info "Removed the ${environment} environment ThunderID" \
+        || warn "Could not fully remove the ${environment} environment ThunderID"
+    fi
   else
-    warn "Could not download remove-environment-thunder.sh; the default environment Thunder was not removed"
+    info "The ${environment} environment ThunderID was not found, skipping"
   fi
-else
-  info "Default environment Thunder not found, skipping"
-fi
-uninstall_release "api-platform-${ORG_NAME}-default" "${DATA_PLANE_NS}"
+  uninstall_release "api-platform-${ORG_NAME}-${environment}" "${DATA_PLANE_NS}"
+  if [ "${environment}" != default ]; then
+    kubectl label environment.openchoreo.dev "${environment}" -n "${DEFAULT_NS}" "${ADOPTED_LABEL}-" >/dev/null 2>&1 \
+      && info "Kept environment ${environment}"
+  fi
+done
 kubectl delete secret gateway-idp-credentials -n "${DATA_PLANE_NS}" --ignore-not-found >/dev/null
 kubectl label namespace "${DATA_PLANE_NS}" amp.wso2.com/api-platform-gateway- >/dev/null 2>&1 || true
 
@@ -335,6 +361,13 @@ done
 # cert-manager keeps after its Certificate is gone. Skip gateways whose release
 # still exists, for example after a failed environment removal.
 gateway_releases="$(helm list -n "${DATA_PLANE_NS}" -q 2>/dev/null || true)"
+# The Gateway Operator removes each gateway's Certificate after its release is
+# gone; until then cert-manager re-issues a deleted TLS Secret. Wait for them.
+for _ in $(seq 1 24); do
+  kubectl get certificates.cert-manager.io -n "${DATA_PLANE_NS}" -o name 2>/dev/null \
+    | grep -qE "/api-platform-${ORG_NAME}-[a-z0-9-]+-gw-gateway-controller-tls$" || break
+  sleep 5
+done
 kubectl get job,secret -n "${DATA_PLANE_NS}" -o name 2>/dev/null \
   | grep -E "/api-platform-${ORG_NAME}-[a-z0-9-]+-(bootstrap|token|gw-gateway-controller-tls)$" \
   | while read -r resource; do
