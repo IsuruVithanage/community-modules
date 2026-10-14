@@ -45,13 +45,22 @@ helm pull "oci://${HELM_CHART_REGISTRY}/wso2-amp-platform-resources-extension" -
 
 # Existing objects that Agent Manager uses instead of its own copy, unless its
 # own release created them; leaving them out of an upgrade would delete them.
-owned_by_platform_release() {  # resource [namespace]
+# Removes the partly prepared charts, so a failed run leaves nothing to install.
+abort() { rm -rf "${CORE}" "${PLATFORM}"; exit 1; }
+# Prints "missing", "amp" (created by Agent Manager's platform resources
+# release), or "other". Stops the script when the object cannot be read: a
+# wrong answer here would drop a template that an upgrade then deletes.
+object_state() {  # resource [namespace]
   local args=(get "$1" -o jsonpath='{.metadata.annotations.meta\.helm\.sh/release-name}/{.metadata.annotations.meta\.helm\.sh/release-namespace}')
+  local out
   [ -n "${2:-}" ] && args+=(-n "$2")
-  [ "$(kubectl "${args[@]}" 2>/dev/null)" = "amp-platform-resources/${DEFAULT_NS}" ]
-}
-exists() {  # resource [namespace]
-  if [ -n "${2:-}" ]; then kubectl get "$1" -n "$2" >/dev/null 2>&1; else kubectl get "$1" >/dev/null 2>&1; fi
+  if ! out="$(kubectl "${args[@]}" 2>&1)"; then
+    if grep -q "NotFound" <<<"${out}"; then echo missing; return 0; fi
+    echo "❌ Could not read $1${2:+ in $2}: ${out}" >&2
+    echo "   Nothing was prepared; fix cluster access and run the script again." >&2
+    exit 1
+  fi
+  if [ "${out}" = "amp-platform-resources/${DEFAULT_NS}" ]; then echo amp; else echo other; fi
 }
 
 echo "Adapting the charts for OpenChoreo namespace '${DEFAULT_NS}':"
@@ -107,24 +116,28 @@ if defined != len(templates) or refs == 0:
 print(f"  Build templates: renamed to amp-{', amp-'.join(templates)} ({refs} references)")
 EOF
 
-if exists clustertrait.openchoreo.dev/horizontal-pod-autoscaler && ! owned_by_platform_release clustertrait.openchoreo.dev/horizontal-pod-autoscaler; then
+state="$(object_state clustertrait.openchoreo.dev/horizontal-pod-autoscaler)" || abort
+if [ "${state}" = other ]; then
   # Agent Manager v1.0.0 never uses this trait: its agent component type
   # creates its own HorizontalPodAutoscaler.
   rm "${PLATFORM}/templates/component-traits/hpa-trait.yaml"
   info "ClusterTrait horizontal-pod-autoscaler: left out; the existing one is kept"
 fi
-if exists environment.openchoreo.dev/default "${DEFAULT_NS}" && ! owned_by_platform_release environment.openchoreo.dev/default "${DEFAULT_NS}"; then
+state="$(object_state environment.openchoreo.dev/default "${DEFAULT_NS}")" || abort
+if [ "${state}" = other ]; then
   rm "${PLATFORM}/templates/environment.yaml"
   info "Environment default: left out; Agent Manager uses the existing one"
 fi
 # OpenChoreo's getting-started resources include a default Project and
 # DeploymentPipeline. Agent Manager's agents then go into that project and follow
 # that pipeline, starting at its first environment.
-if exists project.openchoreo.dev/default "${DEFAULT_NS}" && ! owned_by_platform_release project.openchoreo.dev/default "${DEFAULT_NS}"; then
+state="$(object_state project.openchoreo.dev/default "${DEFAULT_NS}")" || abort
+if [ "${state}" = other ]; then
   rm "${PLATFORM}/templates/project.yaml"
   info "Project default: left out; Agent Manager uses the existing one"
 fi
-if exists deploymentpipeline.openchoreo.dev/default "${DEFAULT_NS}" && ! owned_by_platform_release deploymentpipeline.openchoreo.dev/default "${DEFAULT_NS}"; then
+state="$(object_state deploymentpipeline.openchoreo.dev/default "${DEFAULT_NS}")" || abort
+if [ "${state}" = other ]; then
   rm "${PLATFORM}/templates/deployment-pipeline.yaml"
   info "DeploymentPipeline default: left out; Agent Manager uses the existing one"
 fi

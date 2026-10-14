@@ -162,6 +162,15 @@ ok = ((v.get("gateway") or {}).get("environment") == os.environ["ENV"]
       and any(i.get("issuer") == os.environ["ISSUER"] for i in idps)
       and ((v.get("agentManager") or {}).get("idp") or {}).get("existingSecret"))
 print("configured" if ok else "update")' 2>/dev/null || echo missing)"
+  # Values alone do not show that the last install worked: a failed bootstrap
+  # leaves them in place. Skip only a deployed release whose gateway is up.
+  if [ "${current}" = configured ]; then
+    release_status="$(helm status "${gateway_release}" -n "${DATA_PLANE_NS}" -o json 2>/dev/null \
+      | python3 -c 'import json,sys; print(json.load(sys.stdin)["info"]["status"])' 2>/dev/null || true)"
+    programmed="$(kubectl get apigateway "${gateway_release}" -n "${DATA_PLANE_NS}" \
+      -o jsonpath='{.status.conditions[?(@.type=="Programmed")].status}' 2>/dev/null || true)"
+    [ "${release_status}" = deployed ] && [ "${programmed}" = True ] || current=update
+  fi
   if [ "${current}" = configured ]; then
     info "Gateway ${gateway_release} is configured, skipping"
   else
@@ -173,6 +182,8 @@ print("configured" if ok else "update")' 2>/dev/null || echo missing)"
       --set gateway.environment="${env}" \
       --set agentManager.orgName="${ORG_NAME}" \
       --set agentManager.idp.tokenUrl="${THUNDER_INTERNAL_URL}/oauth2/token" \
+      --set agentManager.apiUrl="http://amp-api.${AMP_NS}.svc.cluster.local:9000/api/v1" \
+      --set apiGateway.controlPlane.host="amp-api-gateway-manager.${AMP_NS}.svc.cluster.local:9243" \
       --set gateway.vhost="${gateway_url}" \
       --set gateway.hostname="${gateway_host}" \
       --set apiGateway.namespace="${DATA_PLANE_NS}" \

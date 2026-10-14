@@ -80,19 +80,28 @@ json() { python3 -c "import json,sys; d=json.load(sys.stdin); $1"; }
 # on stdin, so they never appear in the process list.
 curl_quote() { local v="${1//\\/\\\\}"; v="${v//\"/\\\"}"; printf '"%s"' "$v"; }
 # Prints the names of the resources of the given types that still exist.
+# Fails when a type that exists cannot be listed, so a denied or failed request
+# is never taken to mean that nothing remains.
 remaining() {
-  local type
+  local type out
   for type in "$@"; do
-    kubectl get "${type}" -A --no-headers -o custom-columns=NAME:.metadata.name 2>/dev/null \
-      | sed "s|^|${type%%.*}/|" || true
+    if ! out="$(kubectl get "${type}" -A --no-headers -o custom-columns=NAME:.metadata.name 2>&1)"; then
+      grep -q "the server doesn't have a resource type" <<<"${out}" && continue
+      return 1
+    fi
+    [ -n "${out}" ] && sed "s|^|${type%%.*}/|" <<<"${out}"
   done
+  return 0
 }
 # Waits up to two minutes for the resources of the given types to be deleted,
 # then prints what remains.
 wait_until_unused() {
   local left=""
   for _ in $(seq 1 24); do
-    left="$(remaining "$@")"
+    if ! left="$(remaining "$@")"; then
+      printf '(could not list them; check access to %s)' "$*"
+      return 0
+    fi
     [ -z "${left}" ] && return 0
     sleep 5
   done
@@ -476,20 +485,40 @@ if [ -n "${amp_runs}" ]; then
 fi
 # Deleting a run does not always remove what it created in the workflow plane,
 # and deleting an agent leaves its build runs' objects too. Remove the objects
-# whose run in ${DEFAULT_NS} no longer exists; Argo deletes the pods and the
-# ExternalSecrets their Secrets.
-live_runs="$(kubectl get workflowruns.openchoreo.dev -n "${DEFAULT_NS}" -o name 2>/dev/null | sed 's|.*/||' || true)"
+# of Agent Manager's runs in ${DEFAULT_NS} that no longer exist; Argo deletes the
+# pods and the ExternalSecrets their Secrets. A run is Agent Manager's when its
+# Argo workflow uses Agent Manager's amp-* workflow templates. Other products'
+# runs share the namespace, so nothing is removed unless both lookups succeed.
 orphans=0
-for type in externalsecrets.external-secrets.io workflows.argoproj.io secrets; do
-  while read -r namespace names; do
-    [ -n "${names:-}" ] || continue
-    kubectl delete "${type}" -n "${namespace}" ${names} --ignore-not-found >/dev/null 2>&1 || true
-    orphans=$((orphans + $(wc -w <<<"${names}")))
-  done < <(kubectl get "${type}" -A -o json \
-    -l "openchoreo.dev/managed-by=workflowrun-controller,openchoreo.dev/workflowrun-namespace=${DEFAULT_NS}" 2>/dev/null \
-    | LIVE="${live_runs}" python3 -c '
+run_selector="openchoreo.dev/managed-by=workflowrun-controller,openchoreo.dev/workflowrun-namespace=${DEFAULT_NS}"
+if ! live_runs="$(kubectl get workflowruns.openchoreo.dev -n "${DEFAULT_NS}" -o name 2>/dev/null | sed 's|.*/||')" \
+    || ! amp_runs="$(kubectl get workflows.argoproj.io -A -o json -l "${run_selector}" 2>/dev/null | python3 -c '
+import json, sys
+def refs(node):
+    if isinstance(node, dict):
+        ref = node.get("templateRef")
+        if isinstance(ref, dict) and str(ref.get("name", "")).startswith("amp-"):
+            yield True
+        for value in node.values():
+            yield from refs(value)
+    elif isinstance(node, list):
+        for value in node:
+            yield from refs(value)
+for item in json.load(sys.stdin)["items"]:
+    run = (item["metadata"].get("labels") or {}).get("openchoreo.dev/workflowrun")
+    if run and any(refs(item)):
+        print(run)')"; then
+  warn "Could not list the workflow runs in ${DEFAULT_NS}; their workflow-plane objects were not checked"
+else
+  for type in externalsecrets.external-secrets.io workflows.argoproj.io secrets; do
+    while read -r namespace names; do
+      [ -n "${names:-}" ] || continue
+      kubectl delete "${type}" -n "${namespace}" ${names} --ignore-not-found >/dev/null 2>&1 || true
+      orphans=$((orphans + $(wc -w <<<"${names}")))
+    done < <(kubectl get "${type}" -A -o json -l "${run_selector}" 2>/dev/null \
+      | LIVE="${live_runs}" AMP_RUNS="${amp_runs}" python3 -c '
 import collections, json, os, sys
-live = set(os.environ["LIVE"].split())
+live, amp = set(os.environ["LIVE"].split()), set(os.environ["AMP_RUNS"].split())
 orphans = collections.defaultdict(list)
 for item in json.load(sys.stdin)["items"]:
     meta = item["metadata"]
@@ -497,11 +526,12 @@ for item in json.load(sys.stdin)["items"]:
     # Only the run'"'"'s own objects, which are named after it. Shared ones, such
     # as the workflow service account token, carry the label of the last run
     # that applied them.
-    if run and run not in live and (meta["name"] == run or meta["name"].startswith(run + "-")):
+    if run in amp and run not in live and (meta["name"] == run or meta["name"].startswith(run + "-")):
         orphans[meta["namespace"]].append(meta["name"])
 for namespace, names in orphans.items():
     print(namespace, " ".join(names))' 2>/dev/null || true)
-done
+  done
+fi
 [ "${orphans}" -gt 0 ] && info "Deleted ${orphans} workflow-plane objects of deleted runs"
 # Agent Manager grants its runtime clients OpenChoreo access at run time.
 kubectl get clusterauthzrolebindings.openchoreo.dev -o json 2>/dev/null | python3 -c '
@@ -633,14 +663,19 @@ for key in json.load(sys.stdin):
         print(os.environ["PREFIX"] + "/" + key)' 2>/dev/null || true)"$'\n'
   done
 fi
+# Ownership comes from these two lists; without them nothing is deleted.
+references_listed=true
 labelled="$(kubectl get secretreferences.openchoreo.dev -n "${DEFAULT_NS}" -l managed-by=amp-agent-manager \
-  -o name 2>/dev/null | sed 's|.*/||' || true)"
-all_references="$(kubectl get secretreferences.openchoreo.dev -n "${DEFAULT_NS}" -o name 2>/dev/null | sed 's|.*/||' || true)"
+  -o name 2>/dev/null | sed 's|.*/||')" || references_listed=false
+all_references="$(kubectl get secretreferences.openchoreo.dev -n "${DEFAULT_NS}" -o name 2>/dev/null | sed 's|.*/||')" \
+  || references_listed=false
 candidates="$( { echo "${labelled}"
   kubectl get pushsecrets.external-secrets.io -n "${KV_NS}" -o name 2>/dev/null | sed 's|.*/||'
   echo "${bao_keys}" | sed 's|.*/||'; } | sort -u)"
 classified=""
-if [ -f "${MODULE_DIR}/scripts/amp-secret-names.py" ]; then
+if [ "${references_listed}" != true ]; then
+  warn "Could not list the SecretReferences in ${DEFAULT_NS}, so Agent Manager's secrets were not removed; re-run to retry"
+elif [ -f "${MODULE_DIR}/scripts/amp-secret-names.py" ]; then
   classified="$(echo "${candidates}" | LABELLED="${labelled}" REFERENCES="${all_references}" \
     AGENTS="${known_agents}" ENVIRONMENTS="${known_environments}" python3 "${MODULE_DIR}/scripts/amp-secret-names.py")"
 else
