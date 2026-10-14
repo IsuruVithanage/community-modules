@@ -104,6 +104,17 @@ class CollectorConfigTests(unittest.TestCase):
         self.assertEqual(merged["service"]["pipelines"]["traces"]["processors"],
                          ["resource/amp", "batch", "tail_sampling"])
 
+    def test_named_components_in_the_traces_pipeline_are_used(self):
+        def change(c):
+            c["receivers"]["otlp/ingest"] = c["receivers"].pop("otlp")
+            c["receivers"]["otlp"] = {"protocols": {"http": {"endpoint": "0.0.0.0:14318"}}}  # not in the pipeline
+            c["exporters"]["opensearch/traces"] = c["exporters"].pop("opensearch")
+            c["service"]["pipelines"]["traces"]["receivers"] = ["otlp/ingest"]
+            c["service"]["pipelines"]["traces"]["exporters"] = ["opensearch/traces"]
+        merged = self.merged_with(change)
+        self.assertTrue(merged["receivers"]["otlp/ingest"]["protocols"]["http"]["include_metadata"])
+        self.assertNotIn("include_metadata", merged["receivers"]["otlp"]["protocols"]["http"])
+
     def test_non_receiving_collector_is_refused(self):
         config = copy.deepcopy(self.before)
         config["service"]["pipelines"]["traces"]["exporters"] = ["otlp"]

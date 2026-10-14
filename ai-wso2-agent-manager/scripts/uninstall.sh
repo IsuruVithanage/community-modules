@@ -136,6 +136,10 @@ for c in json.load(sys.stdin)["items"]:
     if t.get("kind") == "ComponentType" and (t.get("name") or "").split("/")[-1] in ("agent-api", "external-agent-api"):
         print((spec.get("owner") or {}).get("projectName", "") + "/" + c["metadata"]["name"])' 2>/dev/null || true
 }
+# Read before anything is deleted: step 4 recognizes an agent's leftover
+# secrets by these names.
+known_agents="$(agent_components | sed 's|.*/||')"
+known_environments="$(kubectl get environments.openchoreo.dev -n "${DEFAULT_NS}" -o name 2>/dev/null | sed 's|.*/||' || true)"
 
 # --- 1. Agents, projects, pipelines, and additional environments -------------
 step "1. Agents, projects, pipelines, and additional environments"
@@ -398,8 +402,15 @@ for environment in $(printf '%s\n' default ${adopted_environments} | awk 'NF && 
   fi
   uninstall_release "api-platform-${ORG_NAME}-${environment}" "${DATA_PLANE_NS}"
   if is_adopted "${environment}"; then
-    kubectl label environment.openchoreo.dev "${environment}" -n "${DEFAULT_NS}" "${ADOPTED_LABEL}-" >/dev/null 2>&1 \
-      && info "Kept environment ${environment}"
+    # The label is what keeps a re-run from treating the environment as one
+    # Agent Manager created, so it stays until both are confirmed gone.
+    if kubectl get namespace "amp-thunder-${ORG_NAME}-${environment}" >/dev/null 2>&1 \
+        || release_exists "api-platform-${ORG_NAME}-${environment}" "${DATA_PLANE_NS}"; then
+      warn "Kept environment ${environment} and its ${ADOPTED_LABEL} label: its ThunderID or gateway is still there; re-run to finish"
+    else
+      kubectl label environment.openchoreo.dev "${environment}" -n "${DEFAULT_NS}" "${ADOPTED_LABEL}-" >/dev/null 2>&1 \
+        && info "Kept environment ${environment}"
+    fi
   fi
 done
 kubectl delete secret gateway-idp-credentials -n "${DATA_PLANE_NS}" --ignore-not-found >/dev/null
@@ -605,9 +616,13 @@ fi
 # Secrets Agent Manager stored through OpenChoreo's secret management: agent API
 # keys and identities, agent environment variables, MCP and LLM proxy keys, and
 # monitor credentials. Each has a SecretReference in the namespace, a Secret and
-# PushSecret in ${KV_NS}, and an OpenBao key, and deleting an agent or proxy
-# can leave some of them behind. They are recognized by Agent Manager's label
-# and by the names it gives them, including names prefixed with an agent's name.
+# PushSecret in ${KV_NS}, and an OpenBao key. Other products keep theirs in the
+# same places, so only what is shown to be Agent Manager's is deleted:
+#   - SecretReferences labelled managed-by=amp-agent-manager, which Agent
+#     Manager sets on every SecretReference it creates, and
+#   - leftovers without a SecretReference, from deleted agents and proxies,
+#     whose names follow a format only Agent Manager uses.
+# Anything else that looks like Agent Manager's is kept and reported.
 bao_keys=""
 if kubectl get pod openbao-0 -n openbao >/dev/null 2>&1; then
   for prefix in "secret/${DEFAULT_NS}/generic" "secret/secret/${DEFAULT_NS}/generic"; do
@@ -620,22 +635,23 @@ for key in json.load(sys.stdin):
 fi
 labelled="$(kubectl get secretreferences.openchoreo.dev -n "${DEFAULT_NS}" -l managed-by=amp-agent-manager \
   -o name 2>/dev/null | sed 's|.*/||' || true)"
+all_references="$(kubectl get secretreferences.openchoreo.dev -n "${DEFAULT_NS}" -o name 2>/dev/null | sed 's|.*/||' || true)"
 candidates="$( { echo "${labelled}"
   kubectl get pushsecrets.external-secrets.io -n "${KV_NS}" -o name 2>/dev/null | sed 's|.*/||'
   echo "${bao_keys}" | sed 's|.*/||'; } | sort -u)"
-amp_secrets="$(echo "${candidates}" | LABELLED="${labelled}" AGENTS="$(printf '%s\n' ${agents} | sed 's|.*/||')" python3 -c '
-import os, re, sys
-names = {line.strip() for line in sys.stdin if line.strip()}
-labelled = set(os.environ["LABELLED"].split())
-agents = set(os.environ["AGENTS"].split())
-owned = re.compile(r"^(.+)-agent-(api-key|identity)-[a-z0-9-]+-secrets$")
-agents.update(m.group(1) for m in map(owned.match, names) if m)
-fixed = re.compile(r"^(amp-(publisher|scheduler)-.+-secrets|.+-agent-(api-key|identity)-[a-z0-9-]+-secrets"
-                   r"|.+-proxy-sec(rets)?|monitor-[0-9a-f-]{36}-secrets)$")
-for name in sorted(names):
-    if name in labelled or fixed.match(name) or (
-            name.endswith("-secrets") and any(name.startswith(a + "-") for a in agents)):
-        print(name)')"
+classified=""
+if [ -f "${MODULE_DIR}/scripts/amp-secret-names.py" ]; then
+  classified="$(echo "${candidates}" | LABELLED="${labelled}" REFERENCES="${all_references}" \
+    AGENTS="${known_agents}" ENVIRONMENTS="${known_environments}" python3 "${MODULE_DIR}/scripts/amp-secret-names.py")"
+else
+  warn "scripts/amp-secret-names.py is missing, so Agent Manager's secrets were not removed; download the module tools again"
+fi
+amp_secrets="$(sed -n 's/^delete //p' <<<"${classified}")"
+unconfirmed="$(sed -n 's/^unconfirmed //p' <<<"${classified}")"
+if [ -n "${unconfirmed}" ]; then
+  warn "Kept $(echo "${unconfirmed}" | wc -l | tr -d ' ') secrets that look like Agent Manager's but could not be confirmed as its own:"
+  warn "  $(echo ${unconfirmed})"
+fi
 if [ -n "${amp_secrets}" ]; then
   # A PushSecret deletes its OpenBao key when it is deleted.
   echo "${amp_secrets}" | xargs kubectl delete secretreferences.openchoreo.dev -n "${DEFAULT_NS}" \

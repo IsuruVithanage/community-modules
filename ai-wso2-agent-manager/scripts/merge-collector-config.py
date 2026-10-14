@@ -45,22 +45,34 @@ def merge_relay(relay):
     if not isinstance(config, dict):
         raise MergeError("The relay configuration is not a YAML mapping.")
     try:
-        protocols = config["receivers"]["otlp"]["protocols"]
         pipeline = config["service"]["pipelines"]["traces"]
+        receivers = config["receivers"]
     except (KeyError, TypeError):
-        raise MergeError("Expected an otlp receiver and a traces pipeline; this is not the tracing module's collector config.") from None
-    if "opensearch" not in (pipeline.get("exporters") or []):
+        raise MergeError("Expected receivers and a traces pipeline; this is not the tracing module's collector config.") from None
+    # Components may be named, such as otlp/ingest; match them by type. Only
+    # the OTLP receivers the traces pipeline uses are changed.
+    otlp = [name for name in (pipeline.get("receivers") or []) if component_type(name) == "otlp"]
+    if not otlp or any(not isinstance((receivers.get(name) or {}).get("protocols"), dict) for name in otlp):
+        raise MergeError("The traces pipeline has no OTLP receiver with protocols; this is not the tracing module's collector config.")
+    if not any(component_type(name) == "opensearch" for name in (pipeline.get("exporters") or [])):
         raise MergeError("The traces pipeline does not export to OpenSearch. Run this against the receiving collector in the observability plane.")
     # The Agent Manager gateway exports over OTLP HTTP.
-    http = protocols.get("http")
-    if http is None:
-        http = protocols["http"] = {"endpoint": "0.0.0.0:4318"}
-    http["include_metadata"] = True
+    with_http = [name for name in otlp if receivers[name]["protocols"].get("http") is not None]
+    if not with_http:
+        receivers[otlp[0]]["protocols"]["http"] = {"endpoint": "0.0.0.0:4318"}
+        with_http = [otlp[0]]
+    for name in with_http:
+        receivers[name]["protocols"]["http"]["include_metadata"] = True
     processors = config.get("processors") or {}
     processors[PROCESSOR] = merge_processor(processors.get(PROCESSOR))
     config["processors"] = processors
     pipeline["processors"] = processor_order(pipeline.get("processors") or [])
     return yaml.safe_dump(config, sort_keys=False)
+
+
+def component_type(name):
+    """The type of a collector component ID: otlp for otlp and otlp/ingest."""
+    return str(name).split("/", 1)[0]
 
 
 def merge_processor(existing):
@@ -84,7 +96,7 @@ def processor_order(processors):
     any processor that drops request metadata. Spans without the headers are
     untouched."""
     order = [name for name in processors if name != PROCESSOR]
-    types = [name.split("/", 1)[0] for name in order]
+    types = [component_type(name) for name in order]
     first_dropping = next((i for i, t in enumerate(types) if t in CONTEXT_DROPPING), len(order))
     if "k8sattributes" in types:
         k8s = types.index("k8sattributes")

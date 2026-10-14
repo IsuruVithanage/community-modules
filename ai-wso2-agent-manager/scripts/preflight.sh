@@ -253,7 +253,8 @@ done < "${WORK}/existing"
 for release in $(sed -n 's/^CRD [^ ]* //p' "${WORK}/existing" | sort -u); do
   count="$(grep -c " ${release}$" "${WORK}/existing")"
   group="$(sed -n "s|^CRD CustomResourceDefinition/[^.]*\.\(.*\) ${release}$|\1|p" "${WORK}/existing" | sort -u | tr '\n' ' ')"
-  if release_chart "${release}" "${DATA_PLANE_NS}" | grep -q .; then
+  namespace="$(awk -v release="${release}" '$1 == release { print $2; exit }' "${WORK}/rendered")"
+  if release_chart "${release}" "${namespace:-${DATA_PLANE_NS}}" | grep -q .; then
     ok "${count} CRDs (${group% }) belong to Agent Manager's ${release} release"
   else
     warn "${count} CRDs (${group% }) already exist from another installation; Helm keeps their current version"
