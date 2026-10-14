@@ -1069,7 +1069,7 @@ bash scripts/uninstall.sh
 
 It ends by listing any Agent Manager Helm releases or namespaces that remain. Expect `None. Agent Manager is removed.`
 
-The script keeps the `${DEFAULT_NS}` namespace and the environments it adopted, and the namespaces OpenChoreo uses for it, `workflows-${DEFAULT_NS}` and `openchoreo-kv-${DEFAULT_NS}`: OpenChoreo and other products use them too.
+The script keeps the `${DEFAULT_NS}` namespace and the environments it adopted, and the namespaces OpenChoreo uses for it, `workflows-${DEFAULT_NS}` and `openchoreo-kv-${DEFAULT_NS}`: OpenChoreo and other products use them too. When the evaluation chart created `workflows-${DEFAULT_NS}`, the script removes the chart's Helm ownership labels and annotations from it.
 
 ---
 

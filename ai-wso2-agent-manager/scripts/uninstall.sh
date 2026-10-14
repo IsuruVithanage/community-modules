@@ -428,6 +428,17 @@ kubectl label namespace "${DATA_PLANE_NS}" amp.wso2.com/api-platform-gateway- >/
 # --- 3. Agent Manager components ---------------------------------------------
 step "3. Agent Manager components"
 uninstall_release amp-evaluation-extension "${WORKFLOW_NS}"
+# The evaluation chart creates workflows-<namespace> when it is missing and keeps
+# it on uninstall. Remove the Helm ownership it leaves on the namespace, so the
+# namespace no longer appears to belong to the removed release.
+if [ "$(kubectl get namespace "workflows-${DEFAULT_NS}" \
+      -o jsonpath='{.metadata.annotations.meta\.helm\.sh/release-name}' 2>/dev/null)" = amp-evaluation-extension ] \
+    && ! helm status amp-evaluation-extension -n "${WORKFLOW_NS}" >/dev/null 2>&1; then
+  kubectl annotate namespace "workflows-${DEFAULT_NS}" meta.helm.sh/release-name- meta.helm.sh/release-namespace- \
+    helm.sh/resource-policy- >/dev/null 2>&1 \
+    && kubectl label namespace "workflows-${DEFAULT_NS}" app.kubernetes.io/managed-by- helm.sh/chart- \
+      app.kubernetes.io/version- >/dev/null 2>&1 || true
+fi
 # Helm never deletes hook resources. The evaluation template is a post-install
 # hook, and each gateway release leaves its pre-install bootstrap RBAC behind.
 kubectl delete clusterworkflowtemplate.argoproj.io amp-monitor-evaluation --ignore-not-found >/dev/null
